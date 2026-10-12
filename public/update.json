@@ -1,6 +1,6 @@
 {
-  "versionCode": 1,
-  "versionName": "1.0.0",
-  "apk": "hongguo-1.0.0.apk",
-  "notes": "首个版本"
+  "versionCode": 101,
+  "versionName": "1.0.1",
+  "apk": "hongguo-1.0.1.apk",
+  "notes": "修复：返回主页后台继续出声、竖屏剧画面拉宽、无效内容黑屏提示不明确；新增：下一集预加载（切集更快）"
 }
