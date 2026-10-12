@@ -90,11 +90,17 @@ class DetailActivity : AppCompatActivity() {
                 }
 
                 if (episodes.isEmpty()) {
-                    statusText.text = getString(R.string.empty)
+                    statusText.text = if (detail.title == seriesId) {
+                        // 服务端没这个条目（已下架/无效 ID）：App 版与网页版都拿不到
+                        // 标题，回退为传入的 seriesId
+                        "该内容可能已下架或暂时无法观看"
+                    } else {
+                        getString(R.string.empty)
+                    }
                     statusText.visibility = View.VISIBLE
                 }
             } catch (e: Exception) {
-                statusText.text = getString(R.string.load_failed)
+                statusText.text = e.message ?: getString(R.string.load_failed)
                 statusText.visibility = View.VISIBLE
             } finally {
                 progress.visibility = View.GONE

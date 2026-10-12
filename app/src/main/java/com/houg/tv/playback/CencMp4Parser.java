@@ -71,6 +71,62 @@ public final class CencMp4Parser {
         public Box stbl;
     }
 
+    /** tkhd 里的显示几何：宽高（16.16 定点数）与旋转角。 */
+    public static final class DisplayGeometry {
+        public int width = 0;
+        public int height = 0;
+        public int rotation = 0;      // 0/90/180/270
+    }
+
+    /**
+     * 解析 trak 的 tkhd box：width/height 是 16.16 定点数，旋转存放在
+     * 3x3 矩阵（[0]=A,[1]=B,[3]=C,[4]=D；竖屏 90° 旋转时 A=D=0, B=1, C=-1）。
+     * 用于竖屏短剧的画幅适配（旋转 90° 的视频横向铺满导致人被拉胖）。
+     */
+    public static DisplayGeometry displayGeometry(byte[] buf, Box trak) {
+        DisplayGeometry g = new DisplayGeometry();
+        try {
+            List<Box> tboxes = parse(buf, trak.start + trak.hdr, trak.end);
+            for (Box b : tboxes) {
+                if (!"tkhd".equals(b.type)) continue;
+                int p = b.start + b.hdr;
+                int ver = buf[p] & 0xFF;
+                p += 4;                            // version + flags
+                if (ver == 1) p += 16;             // v1: creation/modification 各 8 字节
+                else p += 8;                       // v0: 各 4 字节
+                p += 4;                            // track_ID
+                p += 4;                            // reserved
+                p += (ver == 1) ? 8 : 4;           // duration
+                p += 8;                            // reserved[2]
+                p += 8;                            // layer + alternate_group + volume + reserved
+                // 3x3 矩阵：9 个 16.16 定点数（36 字节），[0]=a [1]=b [3]=c [4]=d
+                float a = readFixed1616(buf, p);
+                float bMat = readFixed1616(buf, p + 4);
+                float c = readFixed1616(buf, p + 8);
+                float d = readFixed1616(buf, p + 16);
+                p += 36;
+                g.width = Math.round(readFixed1616(buf, p));
+                g.height = Math.round(readFixed1616(buf, p + 4));
+                // 旋转判定（与标准一致）：
+                // 0°: a=1,d=1  90°: b=1,c=-1  180°: a=-1,d=-1  270°: b=-1,c=1
+                if (a == 1f && d == 1f) g.rotation = 0;
+                else if (a == -1f && d == -1f) g.rotation = 180;
+                else if (bMat == 1f && c == -1f) g.rotation = 90;
+                else if (bMat == -1f && c == 1f) g.rotation = 270;
+                return g;
+            }
+        } catch (Exception ignored) {
+            // 解析失败时返回默认（width=0），调用方回退 ExoPlayer 自身回调
+        }
+        return g;
+    }
+
+    /** 16.16 定点数 → float。 */
+    private static float readFixed1616(byte[] buf, int p) {
+        int v = readU32(buf, p);
+        return v / 65536f;
+    }
+
     /* ---------------- box 解析 ---------------- */
 
     public static boolean isContainer(String type) {

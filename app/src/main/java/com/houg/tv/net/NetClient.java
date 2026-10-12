@@ -302,7 +302,18 @@ public final class NetClient {
         } catch (Exception e) {
             AppLog.INSTANCE.e(TAG, "App 详情失败，回退网页版详情", e);
         }
-        return webDetail(seriesId);
+        try {
+            SeriesDetail w = webDetail(seriesId);
+            if (w.episodes.isEmpty()) {
+                // 两路都拿不到剧集：该 series_id 在服务端无有效内容（已下架/无效条目）。
+                // 抛明确异常，让详情页提示"可能已下架"，而不是让用户看到黑屏卡死。
+                throw new Exception("该内容可能已下架或暂时无法观看");
+            }
+            return w;
+        } catch (Exception e) {
+            AppLog.INSTANCE.e(TAG, "detail 全部失败 series_id=" + seriesId, e);
+            throw e;
+        }
     }
 
     /** App 版详情：data.video_data.video_list[]（每项 vid + vid_index）。 */

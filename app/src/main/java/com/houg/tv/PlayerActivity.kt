@@ -22,6 +22,7 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import com.houg.tv.net.HttpClientProvider
 import com.houg.tv.net.NetClient
 import com.houg.tv.playback.CencMp4Downloader
+import com.houg.tv.playback.CencMp4Parser
 import com.houg.tv.playback.CencMp4Remuxer
 import com.houg.tv.util.AppLog
 import kotlinx.coroutines.CoroutineScope
@@ -60,6 +61,13 @@ class PlayerActivity : AppCompatActivity() {
     /** 视频真实宽高（onVideoSizeChanged 回调，未解析前为 0） */
     private var videoWidth = 0
     private var videoHeight = 0
+    /** 旋转角与像素宽高比：竖屏短剧常带 90° 旋转元数据，不处理会横向铺满（人被拉胖） */
+    private var videoRotation = 0
+    private var pixelRatio = 1f
+    /** 从 mp4 tkhd 解析的显示宽高与旋转角（prepareClearFile 后设置，优先于 ExoPlayer 回调） */
+    private var tkhdWidth = 0
+    private var tkhdHeight = 0
+    private var tkhdRotation = 0
     /** 当前画幅模式下标，见 ASPECT_MODES */
     private var aspectMode = 0
 
@@ -81,6 +89,9 @@ class PlayerActivity : AppCompatActivity() {
     private var danmakuEnabled = true
     private val danmakuFetchedWindows = mutableSetOf<Long>()
     private var lastDanmakuWindow = -1L
+    /** 预加载：已发起预取的下一集位置与任务句柄 */
+    private var prefetchedPos = -1
+    private var prefetchJob: Job? = null
 
     private val playerListener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
@@ -90,6 +101,19 @@ class PlayerActivity : AppCompatActivity() {
         override fun onVideoSizeChanged(size: androidx.media3.common.VideoSize) {
             videoWidth = size.width
             videoHeight = size.height
+            // tkhd 解析结果优先：竖屏短剧带 90° 旋转元数据时 ExoPlayer 回调的
+            // width/height 已是旋转后的（部分老 ROM 解码器不旋转），但保险起见
+            // 以 mp4 tkhd 的显示宽高为准
+            if (tkhdWidth > 0 && tkhdHeight > 0) {
+                if (tkhdRotation == 90 || tkhdRotation == 270) {
+                    // 竖屏视频：显示宽高互换后仍是竖条，直接用
+                    videoWidth = tkhdWidth
+                    videoHeight = tkhdHeight
+                } else {
+                    videoWidth = tkhdWidth
+                    videoHeight = tkhdHeight
+                }
+            }
             applyAspectRatio()
         }
 
@@ -195,10 +219,13 @@ class PlayerActivity : AppCompatActivity() {
         playGen++
         val gen = playGen
 
-        // 切集/起播时清空弹幕缓存并重置弹幕 view
+        // 切集/起播时清空弹幕缓存、画幅元数据与预加载状态（下一集可能横竖屏不同）
         danmakuFetchedWindows.clear()
         lastDanmakuWindow = -1L
         danmakuView.reset()
+        tkhdWidth = 0; tkhdHeight = 0; tkhdRotation = 0
+        videoWidth = 0; videoHeight = 0
+        prefetchedPos = -1
 
         updateEpisodeInfo()
         progress.visibility = View.VISIBLE
@@ -206,6 +233,15 @@ class PlayerActivity : AppCompatActivity() {
 
         playJob = scope.launch {
             try {
+                // 预加载命中：本地已有明文 mp4，直接起播，跳过取流+下载+解密（消除切集卡顿）
+                val cached = withContext(Dispatchers.IO) { findCachedClearFile(vid) }
+                if (cached != null) {
+                    if (gen != playGen) return@launch
+                    AppLog.d("PlayerActivity", "命中预加载缓存 vid=$vid")
+                    parseTkhd(cached.readBytes())
+                    startPlayback(cached)
+                    return@launch
+                }
                 val video = withContext(Dispatchers.IO) {
                     App.netClient.videoModel(vid)
                 }
@@ -221,6 +257,16 @@ class PlayerActivity : AppCompatActivity() {
         }
     }
 
+    /** 查找该 vid 已预加载的明文缓存文件（存在且非空才算命中）。 */
+    private fun findCachedClearFile(vid: String): File? {
+        return try {
+            val f = File(cacheDir, "clear_$vid.mp4")
+            if (f.exists() && f.length() > 1024) f else null
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     /** 下载 → CENC 解密去封装 → 写本地明文 mp4，返回文件。运行在 IO 线程。 */
     private fun prepareClearFile(video: NetClient.VideoModel): File {
         val downloader = CencMp4Downloader(HttpClientProvider.get(this))
@@ -233,11 +279,13 @@ class PlayerActivity : AppCompatActivity() {
                     val t0 = System.currentTimeMillis()
                     val enc = downloader.downloadWithRetry(v.urls)
                     val clear = CencMp4Remuxer.remux(enc, v.cencKey)
+                    parseTkhd(clear)
                     val file = File(cacheDir, "clear_" + video.videoId + ".mp4")
                     file.writeBytes(clear)
                     AppLog.d("PlayerActivity", "prepareClearFile codec=" + v.codec
                             + " height=" + v.height + " enc=" + enc.size
-                            + " clear=" + clear.size + " 耗时(ms)=" + (System.currentTimeMillis() - t0))
+                            + " clear=" + clear.size + " 耗时(ms)=" + (System.currentTimeMillis() - t0)
+                            + " tkhd=" + tkhdWidth + "x" + tkhdHeight + " rot=" + tkhdRotation)
                     return file
                 } catch (e: Exception) {
                     AppLog.e("PlayerActivity", "变体下载/解密失败", e)
@@ -248,6 +296,7 @@ class PlayerActivity : AppCompatActivity() {
             try {
                 val enc = downloader.downloadWithRetry(video.urls)
                 val clear = CencMp4Remuxer.remux(enc, video.cencKey)
+                parseTkhd(clear)
                 val file = File(cacheDir, "clear_" + video.videoId + ".mp4")
                 file.writeBytes(clear)
                 return file
@@ -256,6 +305,25 @@ class PlayerActivity : AppCompatActivity() {
             }
         }
         throw Exception("视频下载或解密失败")
+    }
+
+    /** 从解密后的 mp4 解析 tkhd 显示宽高与旋转角（用于竖屏画幅适配）。 */
+    private fun parseTkhd(clear: ByteArray) {
+        try {
+            val top = CencMp4Parser.parse(clear, 0, clear.size)
+            for (trak in CencMp4Parser.findRecursive(top, "trak")) {
+                val g = CencMp4Parser.displayGeometry(clear, trak)
+                // 只取视频轨（宽高非 0 的那条；音频轨宽高为 0）
+                if (g.width > 0 && g.height > 0) {
+                    tkhdWidth = g.width
+                    tkhdHeight = g.height
+                    tkhdRotation = g.rotation
+                    return
+                }
+            }
+        } catch (e: Exception) {
+            AppLog.d("PlayerActivity", "tkhd 解析失败: " + (e.message ?: ""))
+        }
     }
 
     private fun startPlayback(file: File) {
@@ -337,11 +405,72 @@ class PlayerActivity : AppCompatActivity() {
         danmakuView.setPlaying(p.isPlaying)
         danmakuView.setRate(SPEEDS[speedIndex])
         if (dur <= 0) return
+        // 播放进度走到 80% 时预加载下一集（取流+下载+解密），消除切集卡顿
+        if (dur > 0 && pos >= dur * 4 / 5) prefetchNext()
         val window = pos / DANMAKU_WINDOW_MS * DANMAKU_WINDOW_MS
         if (window == lastDanmakuWindow) return
         lastDanmakuWindow = window
         if (danmakuFetchedWindows.contains(window)) return
         fetchDanmaku(window, dur)
+    }
+
+    /**
+     * 预加载下一集：提前请求 videoModel 并下载解密到本地缓存文件。
+     * 切集时若缓存命中则跳过网络直接起播。用 prefetchGen 防重复、防旧任务覆盖。
+     */
+    private fun prefetchNext() {
+        val nextPos = currentPos + 1
+        if (nextPos >= vidList.size) return
+        if (prefetchedPos == nextPos) return
+        if (prefetchJob?.isActive == true) return
+        prefetchedPos = nextPos
+        val vid = vidList[nextPos]
+        val gen = playGen
+        prefetchJob = scope.launch {
+            try {
+                AppLog.d("PlayerActivity", "预加载下一集 pos=$nextPos vid=$vid")
+                val video = withContext(Dispatchers.IO) { App.netClient.videoModel(vid) }
+                val file = withContext(Dispatchers.IO) {
+                    val downloader = CencMp4Downloader(HttpClientProvider.get(this@PlayerActivity))
+                    var out: File? = null
+                    if (video.variants.isNotEmpty()) {
+                        for (v in video.variants) {
+                            if (!v.encrypted) continue
+                            try {
+                                val clear = CencMp4Remuxer.remux(
+                                        downloader.downloadWithRetry(v.urls), v.cencKey)
+                                val f = File(cacheDir, "clear_" + video.videoId + ".mp4")
+                                f.writeBytes(clear)
+                                out = f
+                                break
+                            } catch (e: Exception) {
+                                AppLog.e("PlayerActivity", "预加载变体失败", e)
+                            }
+                        }
+                    }
+                    if (out == null && video.urls.isNotEmpty()) {
+                        try {
+                            val clear = CencMp4Remuxer.remux(
+                                    downloader.downloadWithRetry(video.urls), video.cencKey)
+                            val f = File(cacheDir, "clear_" + video.videoId + ".mp4")
+                            f.writeBytes(clear)
+                            out = f
+                        } catch (e: Exception) {
+                            AppLog.e("PlayerActivity", "预加载兜底失败", e)
+                        }
+                    }
+                    out
+                }
+                if (gen != playGen) return@launch
+                AppLog.d("PlayerActivity", "预加载完成 pos=$nextPos file=${file?.name}")
+            } catch (e: Exception) {
+                if (gen == playGen) {
+                    // 预加载失败不打扰用户，切集时走正常路径重试
+                    AppLog.d("PlayerActivity", "预加载失败 pos=$nextPos: " + (e.message ?: ""))
+                    prefetchedPos = -1
+                }
+            }
+        }
     }
     private fun fetchDanmaku(window: Long, dur: Long) {
         val vid = vidList.getOrNull(currentPos) ?: return
@@ -364,11 +493,14 @@ class PlayerActivity : AppCompatActivity() {
 
     /** 按当前模式 + 视频真实比例设置画面缩放。 */
     private fun applyAspectRatio() {
+        // 显示比例：竖屏视频（h > w）在横屏 TV 上保持竖条比例，人不会被拉胖
+        val displayW = videoWidth.toFloat()
+        val displayH = videoHeight.toFloat()
         when (ASPECT_MODES[aspectMode]) {
             AspectMode.FIT -> {
                 videoContainer.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                if (videoWidth > 0 && videoHeight > 0) {
-                    videoContainer.setAspectRatio(videoWidth.toFloat() / videoHeight)
+                if (displayW > 0 && displayH > 0) {
+                    videoContainer.setAspectRatio(displayW / displayH)
                 }
             }
             AspectMode.STRETCH -> {
@@ -379,8 +511,8 @@ class PlayerActivity : AppCompatActivity() {
             }
             AspectMode.FILL -> {
                 videoContainer.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                if (videoWidth > 0 && videoHeight > 0) {
-                    videoContainer.setAspectRatio(videoWidth.toFloat() / videoHeight)
+                if (displayW > 0 && displayH > 0) {
+                    videoContainer.setAspectRatio(displayW / displayH)
                 }
             }
         }
@@ -581,12 +713,33 @@ class PlayerActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
-        // 切后台前记录当前进度，回前台从该处续播
+        // 用户反馈：按主页返回后后台还在出声音。Activity 不可见时必须暂停
+        //（recordHistory 记录进度，回前台 onResume 恢复播放）
         resumePosition = try {
             val p = player
             if (p != null && p.duration > 0) p.currentPosition.toInt() else 0
         } catch (_: Exception) {
             0
+        }
+        recordHistory()
+        player?.pause()
+        updatePlayPauseButton()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // 从后台/按主页返回后回前台：从记录位置续播
+        if (resumePosition > 0) {
+            try {
+                val p = player ?: return
+                if (p.duration > 0) p.seekTo(resumePosition.toLong())
+            } catch (_: Exception) {
+            }
+            resumePosition = 0
+        }
+        if (player != null && player!!.playbackState != Player.STATE_IDLE) {
+            player?.play()
+            updatePlayPauseButton()
         }
     }
 
