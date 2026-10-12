@@ -1454,6 +1454,13 @@ public final class NetClient {
     private static String valueToString(Object v) {
         if (v == null || v == JSONObject.NULL) return "";
         if (v instanceof String) return (String) v;
+        // 整型（尤其 series_id 这类 19 位长整型）必须直接 toString，严禁经 double：
+        // 超过 2^53 的 long 转 double 会丢失末几位精度（实例：7683457453203147801
+        // → 7683457453203147776）。此前建议接口返回的数字型 series_id 全被改坏，
+        // 与网页搜索页的字符串型 series_id_str 去重时互不相等 → 同一部剧出现
+        // 两张卡片，坏 ID 那张点进去必然 404（用户看到的「重复的第十/九季，
+        // 一个连不上一个能看」即此因）。
+        if (v instanceof Long || v instanceof Integer) return String.valueOf(v);
         if (v instanceof Number) {
             double d = ((Number) v).doubleValue();
             if (d == Math.floor(d) && !Double.isInfinite(d)) {

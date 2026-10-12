@@ -168,37 +168,95 @@ class SearchActivity : AppCompatActivity() {
 
         scope.launch {
             try {
-                // 本地首字母/标题匹配（索引已就绪时优先本地，命中则直接出结果）
+                // 本地首字母/标题匹配（索引已就绪时先出结果，保证秒开）
                 val local = if (indexReady) {
                     withContext(Dispatchers.IO) { DramaIndex.search(keyword) }
                 } else emptyList()
+                val localDramas = local.map { e ->
+                    NetClient.Drama.minimal(e.id, e.title, e.cover)
+                }
+                if (gen == searchGen && localDramas.isNotEmpty()) {
+                    adapter.submit(localDramas)
+                }
 
-                if (local.isNotEmpty()) {
-                    if (gen == searchGen) {
-                        adapter.submit(local.map { e ->
-                            NetClient.Drama.minimal(e.id, e.title, e.cover)
-                        })
-                    }
-                } else {
-                    // 本地无命中 → 服务端关键词搜索兜底
-                    val result = withContext(Dispatchers.IO) {
-                        App.netClient.search(keyword)
-                    }
-                    if (gen != searchGen) return@launch
-                    adapter.submit(result)
-                    if (result.isEmpty()) {
-                        statusText.text = getString(R.string.empty)
-                        statusText.visibility = View.VISIBLE
-                    }
+                // 服务端搜索兜底/补全：本地索引来自分类翻页（每分类有页数上限），
+                // 排在截断点之后的剧会缺失（例：多季剧缺个别季，如用户反馈的
+                // 「唢呐修仙」缺 6/8/9 季）。因此本地命中后仍查一次服务端，
+                // 用更全的数据合并修正（建议接口单次即可召回该系列全部季）。
+                val remote = withContext(Dispatchers.IO) {
+                    App.netClient.search(keyword)
+                }
+                if (gen != searchGen) return@launch
+                val merged = mergeResults(localDramas, remote)
+                adapter.submit(merged)
+                if (merged.isEmpty()) {
+                    statusText.text = getString(R.string.empty)
+                    statusText.visibility = View.VISIBLE
                 }
             } catch (e: Exception) {
                 if (gen != searchGen) return@launch
-                statusText.text = getString(R.string.load_failed)
-                statusText.visibility = View.VISIBLE
+                // 本地结果已展示时不覆盖为错误提示，仅无结果时提示
+                if (adapter.itemCount == 0) {
+                    statusText.text = getString(R.string.load_failed)
+                    statusText.visibility = View.VISIBLE
+                }
             } finally {
                 if (gen == searchGen) progress.visibility = View.GONE
             }
         }
+    }
+
+    /**
+     * 合并本地与服务端结果：本地序优先，服务端新增的排在后面。
+     * 去重按 id 和归一化标题双键：
+     * - 同 id：用服务端更全的数据替换（本地 minimal 只有 id/title/cover）；
+     * - 同标题不同 id：保留服务端那条（本地索引的 id 可能是旧版精度 bug
+     *   写入磁盘的坏 ID，点进去必然 404，用户看到的「重复的第十季，
+     *   一个连不上一个能看」即此因）。
+     */
+    private fun mergeResults(
+        local: List<NetClient.Drama>,
+        remote: List<NetClient.Drama>,
+    ): List<NetClient.Drama> {
+        if (local.isEmpty()) return remote
+        if (remote.isEmpty()) return local
+        val remoteById = HashMap<String, NetClient.Drama>()
+        val remoteByTitle = HashMap<String, NetClient.Drama>()
+        for (d in remote) {
+            remoteById[d.id] = d
+            remoteByTitle[normKey(d.title)] = d
+        }
+        val seenIds = HashSet<String>()
+        val seenTitles = HashSet<String>()
+        val result = ArrayList<NetClient.Drama>(local.size + remote.size)
+        for (d in local) {
+            val tk = normKey(d.title)
+            val better = remoteByTitle[tk] ?: remoteById[d.id] ?: d
+            if (!seenIds.add(better.id)) continue
+            if (!seenTitles.add(tk)) continue
+            result.add(better)
+        }
+        for (d in remote) {
+            if (!seenIds.add(d.id)) continue
+            if (!seenTitles.add(normKey(d.title))) continue
+            result.add(d)
+        }
+        return result
+    }
+
+    /** 标题归一化去重键：去空白与常见标点、全角转半角、转小写。 */
+    private fun normKey(s: String): String {
+        val sb = StringBuilder(s.length)
+        for (c in s) {
+            val v = c.code
+            var ch = c
+            if (v in 0xFF01..0xFF5E) ch = (v - 0xFEE0).toChar()
+            if (ch == '　') continue
+            if (ch.isWhitespace()) continue
+            if (ch in "《》·_-：:，,！!？?\"'“”‘’") continue
+            sb.append(ch.lowercaseChar())
+        }
+        return sb.toString()
     }
 
     private fun openDetail(drama: NetClient.Drama) {

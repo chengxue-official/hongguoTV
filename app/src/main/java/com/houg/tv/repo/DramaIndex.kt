@@ -18,8 +18,21 @@ object DramaIndex {
 
     private const val FILE = "drama_index.json"
     private const val TAG = "DramaIndex"
-    /** 每个分类最多翻的页数（每页 18 条） */
-    private const val MAX_PAGES_PER_GENRE = 60
+    /**
+     * 索引结构/抓取策略版本。凡是改变「拉取范围或字段」的改动都必须 +1，
+     * 否则老设备会一直沿用磁盘上的旧索引（旧索引是 60 页上限时代抓的，
+     * 不含后续新增的剧），导致升级后问题依旧。
+     */
+    private const val SCHEMA_VERSION = 2
+    /**
+     * 每个分类最多翻的页数（每页 18 条）。
+     * 注意：ai_series 实测在 offset=1080 时 has_more 仍为 true，即分类池超过
+     * 60×18=1080 条。若上限太低，排在后面的剧（如多季剧的个别季）会被截断，
+     * 导致本地首字母搜索漏剧（用户反馈「唢呐修仙」缺 6/8/9 季的根因之一）。
+     * 200 页 × 18 ≈ 3600 条/分类，足以覆盖现有分类池；仅首次建索引时耗时
+     * （约 1 分钟/分类），之后走磁盘缓存不重复拉取。
+     */
+    private const val MAX_PAGES_PER_GENRE = 200
 
     /** 片名索引项 */
     data class Entry(val id: String, val title: String, val cover: String, val initials: String)
@@ -34,7 +47,10 @@ object DramaIndex {
     @Volatile
     private var entries: List<Entry>? = null
 
-    /** 读索引（内存 → 磁盘 → 触发后台刷新）。可能返回空列表（尚未建立）。 */
+    /**
+     * 读索引（内存 → 磁盘）。磁盘索引版本与 {@link #SCHEMA_VERSION} 不一致时
+     * 视为失效，返回空列表以触发重建。可能返回空列表（尚未建立）。
+     */
     fun load(context: Context): List<Entry> {
         entries?.let { return it }
         val fromDisk = readFromDisk(context)
@@ -99,8 +115,21 @@ object DramaIndex {
         return try {
             val f = File(context.filesDir, FILE)
             if (!f.exists()) return emptyList()
-            val json = JSONArray(f.readText())
-            val list = ArrayList<Entry>(json.length())
+            val raw = f.readText()
+            val list = ArrayList<Entry>()
+            // 新版格式：{"v":2,"list":[...]}；旧版格式：裸数组（无版本信息）。
+            // 旧版一律视为过期（可能是 60 页上限时代抓的残缺索引），丢弃以触发重建。
+            if (raw.trimStart().startsWith("[")) {
+                AppLog.d(TAG, "索引为旧版格式，丢弃并重建")
+                return emptyList()
+            }
+            val root = JSONObject(raw)
+            if (root.optInt("v", 0) != SCHEMA_VERSION) {
+                AppLog.d(TAG, "索引版本不匹配（磁盘=" + root.optInt("v", 0)
+                        + "，期望=" + SCHEMA_VERSION + "），丢弃并重建")
+                return emptyList()
+            }
+            val json = root.optJSONArray("list") ?: return emptyList()
             for (i in 0 until json.length()) {
                 val o = json.optJSONObject(i) ?: continue
                 val id = o.optString("id")
@@ -129,7 +158,10 @@ object DramaIndex {
                 o.put("initials", e.initials)
                 arr.put(o)
             }
-            File(context.filesDir, FILE).writeText(arr.toString())
+            val root = JSONObject()
+            root.put("v", SCHEMA_VERSION)
+            root.put("list", arr)
+            File(context.filesDir, FILE).writeText(root.toString())
         } catch (e: Exception) {
             AppLog.e(TAG, "写索引失败", e)
         }
