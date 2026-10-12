@@ -9,6 +9,8 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.TextView
+import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -36,6 +38,9 @@ class SearchActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var keyboardContainer: FrameLayout
     private var softKeyboard: SoftKeyboard? = null
+    private lateinit var historyPanel: View
+    private lateinit var historyChips: RecyclerView
+    private lateinit var historyAdapter: SearchChipAdapter
     /** 搜索代次：快速连续搜索时丢弃过期响应 */
     private var searchGen = 0
     /** 本地片名索引是否已就绪 */
@@ -49,15 +54,35 @@ class SearchActivity : AppCompatActivity() {
         progress = findViewById(R.id.progress)
         statusText = findViewById(R.id.status_text)
         keyboardContainer = findViewById(R.id.soft_keyboard_container)
+        historyPanel = findViewById(R.id.history_panel)
+        historyChips = findViewById(R.id.history_chips)
         val recycler = findViewById<RecyclerView>(R.id.recycler)
 
         adapter = DramaAdapter { drama -> openDetail(drama) }
         recycler.layoutManager = GridLayoutManager(this, adaptiveGridColumns(this, 150, 2, 10))
         recycler.adapter = adapter
 
+        // 搜索记录：用 RecyclerView 自动换行展示，遥控器可直接导航到每条
+        historyAdapter = SearchChipAdapter(
+            onClick = { kw ->
+                input.setText(kw)
+                input.setSelection(kw.length)
+                doSearch()
+            },
+            onLongClick = { kw ->
+                App.searchHistory.remove(kw)
+                renderSearchHistory()
+                Toast.makeText(this, "已删除", Toast.LENGTH_SHORT).show()
+            }
+        )
+        historyChips.layoutManager =
+            GridLayoutManager(this, adaptiveGridColumns(this, 130, 2, 8))
+        historyChips.adapter = historyAdapter
+
         findViewById<View>(R.id.btn_back).setOnClickListener { finish() }
         findViewById<View>(R.id.btn_do_search).setOnClickListener { doSearch() }
         findViewById<View>(R.id.btn_keyboard).setOnClickListener { toggleKeyboard() }
+        findViewById<View>(R.id.btn_clear_history).setOnClickListener { confirmClearHistory() }
 
         input.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_SEARCH) {
@@ -80,12 +105,41 @@ class SearchActivity : AppCompatActivity() {
             rebuildIndexInBackground()
         }
 
+        renderSearchHistory()
+
         input.requestFocus()
         // TV 上主动唤起系统软键盘（有则用，无则靠内置键盘兜底）
         input.postDelayed({
             val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
             imm?.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
         }, 300)
+    }
+
+    /* ==================== 搜索记录 ==================== */
+
+    /** 渲染搜索记录胶囊（最多展示 CHIP_MAX 条，避免铺满屏幕）。 */
+    private fun renderSearchHistory() {
+        val list = App.searchHistory.list()
+        if (list.isEmpty()) {
+            historyPanel.visibility = View.GONE
+            historyAdapter.submit(emptyList())
+            return
+        }
+        historyPanel.visibility = View.VISIBLE
+        historyAdapter.submit(list.take(CHIP_MAX))
+    }
+
+    private fun confirmClearHistory() {
+        AlertDialog.Builder(this)
+            .setTitle(getString(R.string.clear))
+            .setMessage(R.string.clear_search_history_confirm)
+            .setPositiveButton(getString(R.string.clear)) { _, _ ->
+                App.searchHistory.clear()
+                renderSearchHistory()
+                Toast.makeText(this, R.string.cleared, Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
     private fun initSoftKeyboard() {
@@ -153,6 +207,9 @@ class SearchActivity : AppCompatActivity() {
     private fun doSearch() {
         val keyword = input.text.toString().trim()
         if (keyword.isEmpty()) return
+        // 记入搜索历史（去重上浮），并刷新胶囊区
+        App.searchHistory.add(keyword)
+        renderSearchHistory()
         // 收起系统软键盘，避免遮挡结果列表
         val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
         imm?.hideSoftInputFromWindow(input.windowToken, 0)
@@ -270,5 +327,10 @@ class SearchActivity : AppCompatActivity() {
     override fun onDestroy() {
         scope.cancel()
         super.onDestroy()
+    }
+
+    private companion object {
+        /** 搜索记录最多展示的胶囊数（超出需点「清空」管理，避免铺满屏幕） */
+        const val CHIP_MAX = 8
     }
 }

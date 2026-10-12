@@ -7,7 +7,6 @@ import android.os.Looper
 import android.view.KeyEvent
 import android.view.SurfaceView
 import android.view.View
-import android.view.ViewParent
 import android.widget.SeekBar
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
@@ -35,10 +34,18 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.RandomAccessFile
+import java.util.Locale
 
 /**
  * 播放器：ExoPlayer（media3），下载→CENC 解密去封装→播本地明文 mp4（HEVC hvc1 + AAC）。
- * 播放栏对齐 Flutter 版：进度条 + 播放/暂停 + 上一集/下一集 + 返回。
+ *
+ * 交互（遥控器优先，无底部导航栏）：
+ *  - OK 键           ：播放 / 暂停
+ *  - 左右键          ：快退 / 快进 15 秒；长按按键重复事件会叠加步长（15s→30s→45s…）
+ *  - 上 / 下键       ：上一集 / 下一集
+ *  - 菜单键          ：调出菜单（画面填充、弹幕开关、倍速、退出）
+ *  - 返回键          ：继续播放 / 退出播放
+ *  - 任意按键        ：短暂显示顶部集信息与底部进度（自动隐藏，不抢焦点）
  */
 class PlayerActivity : AppCompatActivity() {
 
@@ -76,20 +83,44 @@ class PlayerActivity : AppCompatActivity() {
     /** 当前画幅模式下标，见 ASPECT_MODES */
     private var aspectMode = 0
 
+    /** 本集起播时是否已经做过「续播 seek」（避免重复 seek 打断用户手动拖动） */
+    private var resumedThisEpisode = false
+    /** 正在切集：用于抑制切集瞬间的虚假 STATE_ENDED 回调 */
+    private var switchingEpisode = false
+    /** 本集起播是否已失败（解码/网络）。失败时上下键仍可切走，但不再自动跳集。 */
+    private var currentEpisodeFailed = false
+    /**
+     * 切集抑制的安全兜底：STATE_READY / onPlayerError 理论上都会解除抑制，
+     * 但为了防任何未知的卡死路径（如某些 ROM 回调丢失），切集时同时挂一个
+     * 延迟任务，到点强制解除——上下键永不能被锁死。
+     */
+    private val switchGuardRunnable = Runnable {
+        if (switchingEpisode) {
+            AppLog.d("PlayerActivity", "切集抑制超时（兜底解除）")
+            switchingEpisode = false
+        }
+    }
+    /** 上次写观看历史的时间戳（节流，避免 500ms 一次写盘） */
+    private var lastHistoryWrite = 0L
+
     private lateinit var videoContainer: AspectRatioFrameLayout
     private lateinit var surfaceView: SurfaceView
+    private lateinit var topBar: View
     private lateinit var controlBar: View
+    private lateinit var menuPanel: View
     private lateinit var seekBar: SeekBar
-    private lateinit var btnPlayPause: TextView
-    private lateinit var btnPrev: TextView
-    private lateinit var btnNext: TextView
-    private lateinit var btnAspect: TextView
     private lateinit var episodeInfo: TextView
+    private lateinit var positionText: TextView
+    private lateinit var durationText: TextView
+    private lateinit var toastHint: TextView
+    private lateinit var menuFill: TextView
+    private lateinit var menuDanmaku: TextView
+    private lateinit var menuSpeed: TextView
+    private lateinit var menuExit: TextView
     private lateinit var progress: View
     private lateinit var errorText: TextView
-    private lateinit var btnSpeed: TextView
-    private lateinit var btnDanmaku: TextView
     private lateinit var danmakuView: DanmakuView
+
     private var speedIndex = 2
     private var danmakuEnabled = true
     private val danmakuFetchedWindows = mutableSetOf<Long>()
@@ -100,7 +131,13 @@ class PlayerActivity : AppCompatActivity() {
 
     private val playerListener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
-            if (playbackState == Player.STATE_ENDED) onEpisodeComplete()
+            when (playbackState) {
+                // 真正就绪：此刻起才是可信的播放状态，解除切集抑制。
+                // 不能提前在 startPlayback() 末尾复位——prepare() 是异步的，
+                // 解码器初始化期的 STATE_ENDED 会在那之后才投递过来，抑制窗口太短会漏。
+                Player.STATE_READY -> releaseSwitchGuard()
+                Player.STATE_ENDED -> onEpisodeComplete()
+            }
         }
 
         override fun onVideoSizeChanged(size: androidx.media3.common.VideoSize) {
@@ -123,8 +160,19 @@ class PlayerActivity : AppCompatActivity() {
 
         override fun onPlayerError(error: PlaybackException) {
             progress.visibility = View.GONE
+            // ⚠️ 解码失败的终态是 STATE_IDLE，永远不会再进 STATE_READY。
+            // 若不复位切换抑制标记，switchingEpisode 会永久为 true，
+            // 用户按上下键切集将被永久拦截（只有退出播放页才能恢复）。
+            currentEpisodeFailed = true
+            releaseSwitchGuard()
             showError("当前设备可能不支持 H.265 解码（" + error.errorCodeName + "）")
         }
+    }
+
+    /** 解除切集抑制（同时撤掉兜底任务）。 */
+    private fun releaseSwitchGuard() {
+        handler.removeCallbacks(switchGuardRunnable)
+        switchingEpisode = false
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -141,17 +189,20 @@ class PlayerActivity : AppCompatActivity() {
 
         surfaceView = findViewById(R.id.video_surface)
         videoContainer = findViewById(R.id.video_container)
+        topBar = findViewById(R.id.top_bar)
         controlBar = findViewById(R.id.control_bar)
+        menuPanel = findViewById(R.id.menu_panel)
         seekBar = findViewById(R.id.seek_bar)
-        btnPlayPause = findViewById(R.id.btn_play_pause)
-        btnPrev = findViewById(R.id.btn_prev)
-        btnNext = findViewById(R.id.btn_next)
-        btnAspect = findViewById(R.id.btn_aspect)
         episodeInfo = findViewById(R.id.episode_info)
+        positionText = findViewById(R.id.position_text)
+        durationText = findViewById(R.id.duration_text)
+        toastHint = findViewById(R.id.toast_hint)
+        menuFill = findViewById(R.id.menu_fill)
+        menuDanmaku = findViewById(R.id.menu_danmaku)
+        menuSpeed = findViewById(R.id.menu_speed)
+        menuExit = findViewById(R.id.menu_exit)
         progress = findViewById(R.id.progress)
         errorText = findViewById(R.id.error_text)
-        btnSpeed = findViewById(R.id.btn_speed)
-        btnDanmaku = findViewById(R.id.btn_danmaku)
         danmakuView = findViewById(R.id.danmaku_view)
 
         // 读取持久化的画幅模式（默认「适应」= 保持比例）、倍速、弹幕开关
@@ -173,22 +224,24 @@ class PlayerActivity : AppCompatActivity() {
         updateEpisodeInfo()
         bindControls()
 
-        // 首次显示播放栏，3 秒后隐藏；ExoPlayer 自管 surface，直接起播
         showControls()
+        // 初始焦点交给隐形锚点：播放页不需要焦点导航，全部按键由 onKeyDown 处理。
+        // 若不指定，TV 可能把焦点给到某个可聚焦控件（历史版本曾落在 SeekBar 上，
+        // 导致左右键被 SeekBar 吃掉、快进快退失效）。
+        findViewById<View>(R.id.focus_anchor).post {
+            try { findViewById<View>(R.id.focus_anchor).requestFocus() } catch (_: Exception) {}
+        }
         handler.post(progressRunnable)
         playCurrent()
     }
 
     private fun bindControls() {
-        btnPlayPause.setOnClickListener { togglePlayPause() }
-        btnPrev.setOnClickListener { switchEpisode(currentPos - 1) }
-        btnNext.setOnClickListener { switchEpisode(currentPos + 1) }
-        findViewById<View>(R.id.btn_exit).setOnClickListener { finish() }
-        btnAspect.setOnClickListener { cycleAspect() }
-        btnSpeed.setOnClickListener { cycleSpeed() }
-        btnDanmaku.setOnClickListener { toggleDanmaku() }
+        menuFill.setOnClickListener { cycleAspect() }
+        menuDanmaku.setOnClickListener { toggleDanmaku() }
+        menuSpeed.setOnClickListener { cycleSpeed() }
+        menuExit.setOnClickListener { showExitDialog() }
 
-        surfaceView.setOnClickListener { showControls() }
+        surfaceView.setOnClickListener { togglePlayPause() }
 
         seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
@@ -209,11 +262,14 @@ class PlayerActivity : AppCompatActivity() {
 
     private fun playCurrent() {
         if (vidList.isEmpty()) {
-            finish()
+            // 没有可播内容：提示而不是 finish()，避免用户看到"莫名其妙退回选集"
+            releaseSwitchGuard()
+            showError(getString(R.string.empty))
             return
         }
         if (currentPos < 0 || currentPos >= vidList.size) {
-            finish()
+            AppLog.d("PlayerActivity", "playCurrent 越界 pos=$currentPos size=${vidList.size}，忽略")
+            releaseSwitchGuard()
             return
         }
         val vid = vidList[currentPos]
@@ -222,6 +278,9 @@ class PlayerActivity : AppCompatActivity() {
         playJob?.cancel()
         playGen++
         val gen = playGen
+
+        // 起播前清掉上一集的失败标记
+        currentEpisodeFailed = false
 
         // 切集时取消在途的预加载任务：它下载的是「按旧的下一集算出的目标」，
         // 继续跑只会白抢带宽（且可能与本集写出同一个文件）。
@@ -236,10 +295,16 @@ class PlayerActivity : AppCompatActivity() {
         tkhdWidth = 0; tkhdHeight = 0; tkhdRotation = 0
         videoWidth = 0; videoHeight = 0
         prefetchedPos = -1
+        resumedThisEpisode = false
 
         updateEpisodeInfo()
         progress.visibility = View.VISIBLE
         errorText.visibility = View.GONE
+
+        // 挂兜底：无论 STATE_READY / onPlayerError 谁先到（或都没到），
+        // 到点都强制解除切集抑制，保证上下键永不被锁死。
+        handler.removeCallbacks(switchGuardRunnable)
+        handler.postDelayed(switchGuardRunnable, SWITCH_GUARD_MS)
 
         playJob = scope.launch {
             try {
@@ -260,9 +325,17 @@ class PlayerActivity : AppCompatActivity() {
                 val clearFile = withContext(Dispatchers.IO) { prepareClearFile(video) }
                 if (gen != playGen) return@launch
                 startPlayback(clearFile)
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
+                // ⚠️ 必须 catch Throwable 而非 Exception：1.8GB 内存的老设备上
+                // remux 瞬时占用可达 ~80MB，触发 OutOfMemoryError（属 Error 不属
+                // Exception）。此前漏接导致整个协程崩掉、播放页异常退出。
                 if (gen != playGen) return@launch
+                AppLog.e("PlayerActivity", "起播失败 vid=$vid", e)
                 progress.visibility = View.GONE
+                currentEpisodeFailed = true
+                // 起播失败也必须解除切集抑制，否则之后所有 STATE_ENDED 都被忽略，
+                // 用户按上下键切集将永远没有反应。
+                releaseSwitchGuard()
                 showError(e.message ?: getString(R.string.load_failed))
             }
         }
@@ -352,10 +425,39 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     private fun startPlayback(file: File) {
-        val p = player ?: return
+        val p = player
+        if (p == null) {
+            // Activity 已销毁：解除抑制并按失败处理，避免标记泄漏
+            releaseSwitchGuard()
+            return
+        }
         p.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
         p.prepare()
         applySpeed()
+
+        // 续播：本集若在观看历史里有进度，且不是刚开始（<5s），则从上次位置继续。
+        // 上界在 seek 前用 duration 判断：上次停在片尾附近时不能续播，否则一进去
+        // 立刻 ENDED 会自动跳下一集（观感像"点继续观看直接跳集"）。
+        if (!resumedThisEpisode) {
+            resumedThisEpisode = true
+            val saved = try {
+                App.watchHistory.positionOf(seriesId, currentEpisode())
+            } catch (_: Exception) {
+                0L
+            }
+            if (saved > RESUME_MIN_MS) {
+                val dur = p.duration
+                if (dur <= 0 || saved < dur - END_TOLERANCE_MS) {
+                    resumePosition = saved.toInt()
+                    AppLog.d("PlayerActivity", "续播命中 ep=${currentEpisode()} pos=${saved}ms")
+                } else {
+                    // 停在片尾附近：视为已看完，从头播
+                    resumePosition = 0
+                    AppLog.d("PlayerActivity", "上次位置接近片尾，从头播 saved=$saved dur=$dur")
+                }
+            }
+        }
+
         // 关键：起播过程中若已切到后台（用户按了主页），不能 auto-play，否则会
         // 在后台出声——这正是用户反馈的「返回后还有声音」。等回前台再续播。
         if (isVisibleNow()) {
@@ -366,12 +468,15 @@ class PlayerActivity : AppCompatActivity() {
             shouldBePlaying = false
         }
         if (resumePosition > 0) {
-            p.seekTo(resumePosition.toLong())
+            val savedPos = resumePosition.toLong()
+            p.seekTo(savedPos)
             resumePosition = 0
+            toast(getString(R.string.resume_hint, currentEpisode().toString(), formatMs(savedPos)))
         }
         progress.visibility = View.GONE
-        updatePlayPauseButton()
-        recordHistory()
+        recordHistory(force = true)
+        // 注意：switchingEpisode 由 playerListener 在收到 STATE_READY 时复位，
+        // 覆盖到解码器初始化完成那一刻（比在这里复位更安全）。
     }
 
     /** Activity 是否处于可见（已开始）状态；onStop 之前视为可见。 */
@@ -386,7 +491,7 @@ class PlayerActivity : AppCompatActivity() {
     private fun togglePlayPause() {
         val p = player ?: return
         if (p.isPlaying) p.pause() else p.play()
-        updatePlayPauseButton()
+        recordHistory(force = true)
         showControls()
     }
 
@@ -396,12 +501,12 @@ class PlayerActivity : AppCompatActivity() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(PREF_ASPECT, aspectMode).apply()
         updateAspectLabel()
         applyAspectRatio()
-        showControls()
+        toast(getString(R.string.menu_fill) + "：" + getString(ASPECT_MODES[aspectMode].labelRes))
     }
 
-    /** 更新画幅按钮文案为「画幅·模式名」。 */
+    /** 更新画幅菜单文案为「画面填充：模式名」。 */
     private fun updateAspectLabel() {
-        btnAspect.text = getString(R.string.aspect_ratio) + "·" + getString(ASPECT_MODES[aspectMode].labelRes)
+        menuFill.text = getString(R.string.menu_fill) + "：" + getString(ASPECT_MODES[aspectMode].labelRes)
     }
 
     /** 循环切换倍速档位并持久化。 */
@@ -410,7 +515,7 @@ class PlayerActivity : AppCompatActivity() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(PREF_SPEED, speedIndex).apply()
         updateSpeedLabel()
         applySpeed()
-        showControls()
+        toast(getString(R.string.menu_speed) + "：" + SPEEDS[speedIndex].toString() + "x")
     }
 
     /** 将当前倍速应用到播放器与弹幕时钟。 */
@@ -420,7 +525,7 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     private fun updateSpeedLabel() {
-        btnSpeed.text = "倍速·" + SPEEDS[speedIndex].toString() + "x"
+        menuSpeed.text = getString(R.string.menu_speed) + "：" + SPEEDS[speedIndex].toString() + "x"
     }
 
     /** 切换弹幕开关并持久化。 */
@@ -429,11 +534,17 @@ class PlayerActivity : AppCompatActivity() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_DANMAKU, danmakuEnabled).apply()
         updateDanmakuLabel()
         applyDanmakuVisibility()
-        showControls()
+        // 重新打开弹幕时，当前窗口可能已被标记为"已拉取"（当时开关是关的，拉取被
+        // 跳过），这里清掉标记让它重新拉一次，否则要等下一个 30s 窗口才出弹幕。
+        if (danmakuEnabled) {
+            danmakuFetchedWindows.clear()
+            lastDanmakuWindow = -1L
+        }
+        toast(if (danmakuEnabled) getString(R.string.menu_danmaku_on) else getString(R.string.menu_danmaku_off))
     }
 
     private fun updateDanmakuLabel() {
-        btnDanmaku.text = if (danmakuEnabled) "弹幕·开" else "弹幕·关"
+        menuDanmaku.text = if (danmakuEnabled) getString(R.string.menu_danmaku_on) else getString(R.string.menu_danmaku_off)
     }
 
     private fun applyDanmakuVisibility() {
@@ -504,13 +615,14 @@ class PlayerActivity : AppCompatActivity() {
                 }
                 if (gen != playGen) return@launch
                 AppLog.d("PlayerActivity", "预加载完成 pos=$nextPos file=${file?.name}")
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 // 失败不打扰用户：切集时走正常路径（playCurrent 会重新取流）。
                 // 注意不要把 prefetchedPos 复位，否则每 500ms 会重试一次形成请求风暴。
                 AppLog.d("PlayerActivity", "预加载失败 pos=$nextPos: " + (e.message ?: ""))
             }
         }
     }
+
     private fun fetchDanmaku(window: Long, dur: Long) {
         val vid = vidList.getOrNull(currentPos) ?: return
         val gen = playGen
@@ -557,17 +669,25 @@ class PlayerActivity : AppCompatActivity() {
         }
     }
 
-    private fun updatePlayPauseButton() {
-        val p = player
-        btnPlayPause.text = if (p != null && p.isPlaying) "暂停" else "播放"
-    }
+    /* ==================== 切集 ==================== */
 
     private fun switchEpisode(pos: Int) {
-        if (pos < 0) return
-        if (pos >= vidList.size) {
-            finish()
+        if (switchingEpisode) {
+            // 切集准备中（下载+解密可能数秒）：给个反馈，否则用户以为遥控失灵
+            toast("正在切换…")
             return
         }
+        if (pos < 0) {
+            toast(getString(R.string.first_episode))
+            return
+        }
+        if (pos >= vidList.size) {
+            toast(getString(R.string.last_episode))
+            return
+        }
+        switchingEpisode = true
+        // 先落盘当前集进度，再切走
+        recordHistory(force = true)
         currentPos = pos
         resumePosition = 0
         // 停止上一集；只清理「非当前集、非下一集」的明文临时文件。
@@ -576,23 +696,77 @@ class PlayerActivity : AppCompatActivity() {
         cleanupClearFiles(keep = setOf(vidList.getOrNull(pos), vidList.getOrNull(pos + 1)))
         playCurrent()
         showControls()
+        // 注意：switchingEpisode 不在这里复位——要等新集真正 startPlayback
+        // 才解除抑制，否则新集准备期间的 STATE_ENDED 会被误判成"本集播完"再次切集。
     }
 
+    /**
+     * 一集播完。
+     *
+     * ⚠️ 用户反馈的「点进去观看短剧会闪退回选集界面」根因就在这里：旧实现无条件
+     * 认为 STATE_ENDED 就是"本集看完"，末集直接 finish() → 回到选集页。但切集、
+     * seek、解码器初始化失败等场景也会瞬时抛出 STATE_ENDED，于是用户刚进播放页
+     * 就被弹回选集页，看起来像"闪退"。
+     *
+     * 修复：① 切集过程中忽略；② 只在确实播到接近片尾时才认为播完；
+     *      ③ 末集不再 finish()，而是停在最后一帧并提示，由用户自己退出。
+     */
     private fun onEpisodeComplete() {
-        recordHistory()
+        if (switchingEpisode) {
+            AppLog.d("PlayerActivity", "忽略切集期间的 STATE_ENDED")
+            return
+        }
+        val p = player
+        val dur = p?.duration ?: 0L
+        val pos = p?.currentPosition ?: 0L
+        // 本集已失败（解码/网络）：不能再当"播完"去切下一集，否则会连环失败跳集
+        if (currentEpisodeFailed) {
+            AppLog.d("PlayerActivity", "本集起播失败，忽略 STATE_ENDED")
+            return
+        }
+        // ⚠️ duration 未知时 ExoPlayer 返回 C.TIME_UNSET（一个很大的负数）或 0。
+        // 此时绝不能当成"播完"——解码器初始化失败/无可用轨道也会抛 STATE_ENDED，
+        // 误判会导致进播放页立刻自动跳下一集（观感即"闪退到选集"）。一律忽略。
+        if (dur <= 0 || pos < dur - END_TOLERANCE_MS) {
+            AppLog.d("PlayerActivity", "忽略虚假 STATE_ENDED pos=$pos dur=$dur")
+            return
+        }
+        recordHistory(force = true)
         if (currentPos + 1 < vidList.size) {
             switchEpisode(currentPos + 1)
         } else {
-            finish()
+            // 末集播完：不再自动退出（那是"闪退回选集"的观感），停在原地给提示
+            toast(getString(R.string.ep_played_out))
+            showControls()
         }
     }
 
     /** 当前集号：优先取 epList[位置]，列表缺失时退化为「位置 + 1」 */
     private fun currentEpisode(): Int = epList.getOrNull(currentPos) ?: (currentPos + 1)
 
-    private fun recordHistory() {
-        if (seriesId.isNotEmpty()) {
-            App.watchHistory.record(seriesId, title, cover, currentEpisode())
+    /**
+     * 写入观看历史（含集内进度）。
+     * @param force true 表示关键节点（切集/暂停/退出）必须落盘；false 走节流（10s 一次）
+     *
+     * WatchHistory 现按「集号→进度」映射存储，写本集不会影响其他集的进度。
+     * 仍保留防抹除：位置读不到（prepare 未完成，duration=0 时 currentPosition
+     * 恒为 0）时跳过该集的进度写入，只更新时间戳语义由 record() 内部保证。
+     */
+    private fun recordHistory(force: Boolean = false) {
+        if (seriesId.isEmpty()) return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastHistoryWrite < HISTORY_WRITE_INTERVAL_MS) return
+        lastHistoryWrite = now
+        val p = player
+        val posMs = try {
+            if (p != null && p.duration > 0) p.currentPosition else 0L
+        } catch (_: Exception) {
+            0L
+        }
+        try {
+            App.watchHistory.record(seriesId, title, cover, currentEpisode(), posMs)
+        } catch (e: Exception) {
+            AppLog.e("PlayerActivity", "写历史失败", e)
         }
     }
 
@@ -605,7 +779,7 @@ class PlayerActivity : AppCompatActivity() {
     private fun releasePlayer() {
         player?.let {
             try { it.stop() } catch (_: Exception) {}
-            it.clearMediaItems()
+            try { it.clearMediaItems() } catch (_: Exception) {}
         }
     }
 
@@ -633,38 +807,79 @@ class PlayerActivity : AppCompatActivity() {
         showControls()
     }
 
+    /* ==================== 覆盖层显示 ==================== */
+
+    /** 短暂显示顶部信息条 + 底部进度条（都不是焦点控件，不会抢焦点）。 */
     private fun showControls() {
+        topBar.visibility = View.VISIBLE
         controlBar.visibility = View.VISIBLE
+        updateProgressText()
         handler.removeCallbacks(hideControlsRunnable)
         handler.postDelayed(hideControlsRunnable, 3000)
-        restoreControlFocus()
     }
 
-    /**
-     * TV 焦点修复：控制栏 3 秒自动隐藏会把按钮上的焦点一并清掉，之后按方向键
-     * 全屏没有任何焦点视图可落脚，导致「光标移不到下边栏、OK 键无效」。
-     * 这里在控制栏可见时检查：若当前无焦点（或焦点不在控制栏内），显式把
-     * 焦点交给播放/暂停按钮。post 到下一帧，确保 visibility 变更先完成布局。
-     */
-    private fun restoreControlFocus() {
-        val focused = currentFocus
-        if (focused == null || !isInsideControlBar(focused)) {
-            btnPlayPause.post { btnPlayPause.requestFocus() }
+    private val hideControlsRunnable = Runnable {
+        topBar.visibility = View.GONE
+        controlBar.visibility = View.GONE
+    }
+
+    /** 居中短暂提示（快进/快退/切集/开关状态）。 */
+    private fun toast(msg: String) {
+        toastHint.text = msg
+        toastHint.visibility = View.VISIBLE
+        handler.removeCallbacks(hideToastRunnable)
+        handler.postDelayed(hideToastRunnable, 1200)
+    }
+
+    private val hideToastRunnable = Runnable { toastHint.visibility = View.GONE }
+
+    private fun updateProgressText() {
+        val p = player ?: return
+        val dur = p.duration
+        val pos = p.currentPosition
+        positionText.text = formatMs(pos)
+        durationText.text = if (dur > 0) formatMs(dur) else "--:--"
+    }
+
+    private fun formatMs(ms: Long): String {
+        if (ms <= 0) return "00:00"
+        val totalSec = ms / 1000
+        val h = totalSec / 3600
+        val m = (totalSec % 3600) / 60
+        val s = totalSec % 60
+        return if (h > 0) String.format(Locale.US, "%d:%02d:%02d", h, m, s)
+        else String.format(Locale.US, "%02d:%02d", m, s)
+    }
+
+    /* ==================== 菜单 ==================== */
+
+    private fun toggleMenu() {
+        if (menuPanel.visibility == View.VISIBLE) {
+            hideMenu()
+        } else {
+            showMenu()
         }
     }
 
-    private fun isInsideControlBar(v: View): Boolean {
-        var p: ViewParent? = v.parent
-        while (p != null) {
-            if (p === controlBar) return true
-            p = p.parent
-        }
-        return false
+    private fun showMenu() {
+        menuPanel.visibility = View.VISIBLE
+        updateAspectLabel()
+        updateSpeedLabel()
+        updateDanmakuLabel()
+        menuFill.post { menuFill.requestFocus() }
     }
 
-    private val hideControlsRunnable = Runnable { controlBar.visibility = View.GONE }
+    private fun hideMenu() {
+        menuPanel.visibility = View.GONE
+        // 菜单隐藏后焦点会留在已 GONE 的按钮上，TV 上会导致"方向键全无反应"。
+        // 把焦点交给隐形锚点：锚点不消费任何按键，全部按键仍走 Activity.onKeyDown。
+        findViewById<View>(R.id.focus_anchor).post {
+            try { findViewById<View>(R.id.focus_anchor).requestFocus() } catch (_: Exception) {}
+        }
+    }
 
-    /** 进度条刷新（500ms） */
+    /* ==================== 进度刷新（500ms） ==================== */
+
     private val progressRunnable = object : Runnable {
         override fun run() {
             val p = player
@@ -674,25 +889,42 @@ class PlayerActivity : AppCompatActivity() {
                 if (dur > 0) {
                     seekBar.max = 1000
                     seekBar.progress = (pos * 1000 / dur).toInt()
+                    updateProgressText()
                     // 播放到 80% 时预加载下一集。放在这里而非弹幕函数内，
                     // 避免「关闭弹幕导致预加载一并失效」。
                     if (pos >= dur * 4 / 5) prefetchNext()
                 }
                 updateDanmaku(p, pos, dur)
+                // 周期性落盘进度（节流 10s），保证异常退出也不丢进度
+                recordHistory(force = false)
             }
             handler.postDelayed(this, 500)
         }
     }
 
+    /* ==================== 按键 ==================== */
+
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        // 菜单展开时：只接管菜单键/返回键，方向键留给系统做焦点导航
+        if (menuPanel.visibility == View.VISIBLE) {
+            when (keyCode) {
+                KeyEvent.KEYCODE_MENU -> { hideMenu(); return true }
+                KeyEvent.KEYCODE_BACK -> { hideMenu(); return true }
+                else -> return super.onKeyDown(keyCode, event)
+            }
+        }
+
         when (keyCode) {
             KeyEvent.KEYCODE_BACK -> {
                 // 按返回键直接弹「继续播放 / 退出」对话框（对齐原版交互）
                 showExitDialog()
                 return true
             }
-            // 遥控器确定键：直接暂停/继续播放（用户诉求）。焦点在按钮上时由按钮消费，
-            // 不会走到这里；只有焦点不在按钮（控制栏隐藏）时才由本方法处理。
+            KeyEvent.KEYCODE_MENU -> {
+                showMenu()
+                return true
+            }
+            // 遥控器确定键：直接暂停/继续播放（用户诉求）
             KeyEvent.KEYCODE_DPAD_CENTER,
             KeyEvent.KEYCODE_ENTER,
             KeyEvent.KEYCODE_NUMPAD_ENTER,
@@ -700,15 +932,37 @@ class PlayerActivity : AppCompatActivity() {
                 togglePlayPause()
                 return true
             }
+            // 左右键：快退 / 快进。长按会持续收到 repeatCount>0 的重复事件，
+            // 步长随按住时长线性放大（15s → 30s → 45s …），实现"长按叠加时长"。
+            KeyEvent.KEYCODE_DPAD_LEFT,
+            KeyEvent.KEYCODE_MEDIA_REWIND -> {
+                quickSeek(-1, event.repeatCount)
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT,
+            KeyEvent.KEYCODE_MEDIA_FAST_FORWARD -> {
+                quickSeek(1, event.repeatCount)
+                return true
+            }
+            // 上下键：上一集 / 下一集
+            KeyEvent.KEYCODE_DPAD_UP,
+            KeyEvent.KEYCODE_CHANNEL_UP -> {
+                switchEpisode(currentPos - 1)
+                return true
+            }
+            KeyEvent.KEYCODE_DPAD_DOWN,
+            KeyEvent.KEYCODE_CHANNEL_DOWN -> {
+                switchEpisode(currentPos + 1)
+                return true
+            }
             KeyEvent.KEYCODE_MEDIA_PAUSE -> {
                 player?.pause()
-                updatePlayPauseButton()
+                recordHistory(force = true)
                 showControls()
                 return true
             }
             KeyEvent.KEYCODE_MEDIA_PLAY -> {
                 player?.play()
-                updatePlayPauseButton()
                 showControls()
                 return true
             }
@@ -720,9 +974,34 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     /**
+     * 快进/快退。
+     * @param dir -1 快退，+1 快进
+     * @param repeatCount 系统长按重复计数；0 表示首次按下，步长 15s；
+     *                    每次重复步长递增 15s，让长按越久跳得越多。
+     */
+    private fun quickSeek(dir: Int, repeatCount: Int) {
+        val p = player ?: return
+        val dur = p.duration
+        if (dur <= 0) return
+        val step = QUICK_SEEK_MS * (1 + repeatCount.coerceAtMost(MAX_SEEK_REPEAT).toLong())
+        val target = (p.currentPosition + dir * step).coerceIn(0L, dur)
+        p.seekTo(target)
+        // 只有往回跳时才需要重置弹幕窗口（往前跳旧窗口数据仍有效，避免重复拉取）；
+        // DanmakuView 收到位置回退会自行重置飞行态并重新派生。
+        if (dir < 0) {
+            danmakuFetchedWindows.clear()
+            lastDanmakuWindow = -1L
+        }
+        danmakuView.setPositionMs(target)
+        showControls()
+        toast(if (dir > 0) getString(R.string.seek_forward, (step / 1000).toString() + "s")
+        else getString(R.string.seek_backward, (step / 1000).toString() + "s"))
+    }
+
+    /**
      * 退出确认对话框。用户反馈：选中进度条后按退出，选"继续播放"后
      * 确定键失灵——根因是对话框关闭后焦点丢失。这里在继续播放后
-     * 显式把焦点恢复到播放/暂停按钮。
+     * 显式把焦点恢复到菜单按钮。
      *
      * 返回不了首页修复：原设 cancelable(false) 导致部分 TV ROM 上对话框
      * 按钮无初始焦点时，返回键也被吞，用户被困在播放页。改为 cancelable(true)
@@ -733,13 +1012,13 @@ class PlayerActivity : AppCompatActivity() {
         val p = player
         val wasPlaying = p?.isPlaying == true
         p?.pause()
+        recordHistory(force = true)
         val dialog = AlertDialog.Builder(this)
             .setTitle(title)
             .setMessage("继续播放还是退出？")
             .setPositiveButton("继续播放") { _, _ ->
                 if (wasPlaying) player?.play()
                 showControls()
-                updatePlayPauseButton()
             }
             .setNegativeButton("退出播放") { _, _ -> finish() }
             .setCancelable(true)
@@ -753,14 +1032,10 @@ class PlayerActivity : AppCompatActivity() {
             } catch (_: Exception) {
             }
         }
-        // 关键：对话框真正关闭后再恢复焦点（回调里 requestFocus 会被对话框抢占而失效）
-        dialog.setOnDismissListener {
-            if (!isFinishing) {
-                btnPlayPause.post { btnPlayPause.requestFocus() }
-            }
-        }
         dialog.show()
     }
+
+    /* ==================== 生命周期 ==================== */
 
     override fun onStop() {
         super.onStop()
@@ -774,9 +1049,8 @@ class PlayerActivity : AppCompatActivity() {
         } catch (_: Exception) {
             0
         }
-        recordHistory()
+        recordHistory(force = true)
         player?.pause()
-        updatePlayPauseButton()
     }
 
     override fun onResume() {
@@ -792,14 +1066,20 @@ class PlayerActivity : AppCompatActivity() {
         }
         if (shouldBePlaying && p.playbackState != Player.STATE_IDLE) {
             p.play()
-            updatePlayPauseButton()
         }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // 退出/切走前把进度落盘（onDestroy 不保证一定执行）
+        recordHistory(force = true)
     }
 
     override fun onDestroy() {
         scope.cancel()
         handler.removeCallbacksAndMessages(null)
-        player?.release()
+        recordHistory(force = true)
+        try { player?.release() } catch (_: Exception) {}
         player = null
         cleanupClearFiles()
         super.onDestroy()
@@ -820,6 +1100,24 @@ class PlayerActivity : AppCompatActivity() {
         private const val PREF_SPEED = "playback_speed"
         private const val PREF_DANMAKU = "danmaku_enabled"
         private const val DANMAKU_WINDOW_MS = 30000L
+
+        /** 快进退基础步长：15 秒 */
+        private const val QUICK_SEEK_MS = 15_000L
+        /** 长按叠加的最大重复级数（避免一次跨太多） */
+        private const val MAX_SEEK_REPEAT = 7
+
+        /** 判为"真的播完"的容差：位置需在片尾 1.5s 内 */
+        private const val END_TOLERANCE_MS = 1500L
+        /** 续播的最小进度：小于 5s 视为从头看 */
+        private const val RESUME_MIN_MS = 5_000L
+        /** 播放中写观看历史的节流间隔 */
+        private const val HISTORY_WRITE_INTERVAL_MS = 10_000L
+
+        /**
+         * 切集抑制兜底时限：正常起播（含下载+解密）远快于此。
+         * 到点仍未收到 STATE_READY/onPlayerError 就强制解除，保证上下键不锁死。
+         */
+        private const val SWITCH_GUARD_MS = 45_000L
 
         /** tkhd 解析时读取的文件头长度（moov 通常在前 256KB 内）。 */
         private const val MOOV_PROBE_BYTES = 256 * 1024

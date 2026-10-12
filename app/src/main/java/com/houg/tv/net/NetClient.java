@@ -501,13 +501,42 @@ public final class NetClient {
             throw new Exception("红果弹幕接口未返回数据");
         }
 
-        JSONObject extra = data.optJSONObject("extra");
-        long nextMs = parseLongStr(extra == null ? null : extra.optString("next_query_danmaku_list_time"));
+        // 时间窗口推进值（本窗口右边界）。
+        // ⚠️ 服务端已改版：老的 extra.next_query_danmaku_list_time 不再下发（恒为 null），
+        // 若仍按旧字段解析会得到 -1L → 每窗口都提前判空返回，
+        // 结果就是"弹幕开了跟没开一样"。新字段在 common_list_info.cursor 里，
+        // 它本身是一个被字符串化的 JSON，内含 end_offset_time。
+        JSONObject cli = data.optJSONObject("common_list_info");
+        long nextMs = -1L;
+        long totalCount = -1L;
+        if (cli != null) {
+            String cursorRaw = cli.optString("cursor", "");
+            if (!cursorRaw.isEmpty()) {
+                try {
+                    JSONObject cursor = new JSONObject(cursorRaw);
+                    nextMs = parseLongStr(cursor.optString("end_offset_time"));
+                    if (cursor.has("danmaku_count")) {
+                        totalCount = cursor.optLong("danmaku_count", -1L);
+                    }
+                } catch (Exception e) {
+                    AppLog.INSTANCE.e(TAG, "danmaku cursor 解析失败: " + cursorRaw, e);
+                }
+            }
+        }
+        // 兼容旧版字段（服务端灰度期间可能仍下发）
+        if (nextMs <= 0) {
+            JSONObject extra = data.optJSONObject("extra");
+            long legacy = parseLongStr(extra == null ? null : extra.optString("next_query_danmaku_list_time"));
+            if (legacy > 0) nextMs = legacy;
+        }
+        // 最后兜底：服务端两个窗口字段都没给时，按 startMs + 30s 推进。
+        // 不能直接返回空——否则整集弹幕永远为 0（本次 bug 的病灶）。
         if (nextMs <= startMs) {
-            return new ArrayList<DanmakuItem>();
+            nextMs = startMs + WINDOW_MS;
+            AppLog.INSTANCE.d(TAG, "danmaku 无窗口字段，兜底推进到 " + nextMs);
         }
         // 对齐参考实现：最后一窗的 next 会超过剧集时长，需截断到 duration 而不是丢弃整窗
-        nextMs = Math.min(nextMs, durationMs);
+        if (durationMs > 0) nextMs = Math.min(nextMs, durationMs);
 
         List<DanmakuItem> items = new ArrayList<>();
         Set<String> seen = new LinkedHashSet<>();
@@ -545,19 +574,9 @@ public final class NetClient {
                 return a.timeMs < b.timeMs ? -1 : (a.timeMs > b.timeMs ? 1 : 0);
             }
         });
-        // 从 common_list_info.cursor（字符串化 JSON）里解析 danmaku_count，用于日志诊断"数据是否为空"
-        long totalCount = -1;
-        JSONObject cli = data.optJSONObject("common_list_info");
-        if (cli != null) {
-            String cursorRaw = cli.optString("cursor", "");
-            if (!cursorRaw.isEmpty()) {
-                try {
-                    totalCount = new JSONObject(cursorRaw).optLong("danmaku_count", -1);
-                } catch (Exception ignored) {
-                }
-            }
-        }
-        AppLog.INSTANCE.d(TAG, "danmaku 返回 " + items.size() + " 条 (整集 danmaku_count=" + totalCount + ")");
+        // totalCount 已在上方解析 cursor 时取出，用于日志诊断"数据是否为空"
+        AppLog.INSTANCE.d(TAG, "danmaku 返回 " + items.size() + " 条 (窗口 " + startMs
+                + "→" + nextMs + "，整集 danmaku_count=" + totalCount + ")");
         return items;
     }
 
@@ -1378,6 +1397,9 @@ public final class NetClient {
     /* ==================== 弹幕解析辅助 ==================== */
 
     private static final int MAX_COMMENT_ID_LEN = 120;
+
+    /** 弹幕时间窗口长度，需与 PlayerActivity.DANMAKU_WINDOW_MS 保持一致。 */
+    private static final long WINDOW_MS = 30000L;
 
     private static final Pattern DANMAKU_EMOJI_PATTERN = Pattern.compile("\\[[^\\[\\]\\s]{1,10}\\]");
 

@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">红果短剧</string>
-    <string name="nav_recommend">推荐</string>
     <string name="nav_search">搜索</string>
-    <string name="nav_history">追剧</string>
+    <string name="nav_history">历史</string>
+    <string name="nav_favorite">收藏</string>
     <string name="nav_log">日志</string>
     <string name="nav_update">检查更新</string>
     <string name="log_title">调试日志</string>
@@ -12,22 +12,50 @@
     <string name="log_empty">（暂无日志）</string>
     <string name="log_interface_info">Base URL: %1$s\ndevice_id: %2$s\niid: %3$s\nX-Gorgon: %4$s</string>
     <string name="search_hint">搜索短剧</string>
-    <string name="loading">加载中…</string>
     <string name="empty">暂无内容</string>
-    <string name="empty_history">还没有追剧记录，去首页看看吧</string>
+    <string name="empty_history">还没有观看记录，去首页看看吧</string>
+    <string name="empty_favorite">还没有收藏内容，去首页看看吧</string>
     <string name="load_failed">加载失败，请重试</string>
-    <string name="retry">重试</string>
     <string name="back">返回</string>
-    <string name="play">播放</string>
     <string name="continue_watch">继续播放</string>
     <string name="episode_count">共 %1$s 集</string>
     <string name="play_error">播放失败：%1$s</string>
-    <string name="aspect_ratio">画幅</string>
     <string name="aspect_fit">适应</string>
     <string name="aspect_stretch">拉伸</string>
     <string name="aspect_original">原始</string>
     <string name="aspect_fill">填充</string>
     <string name="keyboard">键盘</string>
-    <string name="search_by_initial">拼音首字母 / 关键词搜索</string>
     <string name="index_building">正在建立片名索引，请稍候…</string>
+
+    <!-- 收藏 -->
+    <string name="favorite">收藏</string>
+    <string name="favorited">已收藏</string>
+    <string name="favorite_added">已加入收藏</string>
+    <string name="favorite_removed">已取消收藏</string>
+    <string name="title_favorite">我的收藏</string>
+    <string name="title_history">观看历史</string>
+
+    <!-- 续播 -->
+    <string name="continue_ep">继续观看 第 %1$s 集</string>
+    <string name="resume_hint">继续上次进度：第 %1$s 集 %2$s</string>
+    <string name="watched_ep">上次看到第 %1$s 集</string>
+
+    <!-- 清空 -->
+    <string name="clear">清空</string>
+    <string name="clear_history_confirm">确定清空全部观看历史吗？</string>
+    <string name="clear_search_history_confirm">确定清空全部搜索记录吗？</string>
+    <string name="cleared">已清空</string>
+    <string name="search_history">搜索记录</string>
+
+    <!-- 播放器提示 -->
+    <string name="last_episode">已经是最后一集了</string>
+    <string name="first_episode">已经是第一集了</string>
+    <string name="ep_played_out">已播放完最后一集</string>
+    <string name="seek_forward">快进 %1$s</string>
+    <string name="seek_backward">快退 %1$s</string>
+    <string name="menu_fill">画面填充</string>
+    <string name="menu_danmaku_on">弹幕：开</string>
+    <string name="menu_danmaku_off">弹幕：关</string>
+    <string name="menu_speed">倍速</string>
+    <string name="menu_exit">退出播放</string>
 </resources>

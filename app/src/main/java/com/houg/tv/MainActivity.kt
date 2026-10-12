@@ -107,7 +107,12 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, SearchActivity::class.java))
         }
         findViewById<TextView>(R.id.btn_history).setOnClickListener {
-            startActivity(Intent(this, HistoryActivity::class.java))
+            startActivity(Intent(this, HistoryActivity::class.java)
+                .putExtra(HistoryActivity.EXTRA_TAB, HistoryActivity.TAB_HISTORY))
+        }
+        findViewById<TextView>(R.id.btn_favorite).setOnClickListener {
+            startActivity(Intent(this, HistoryActivity::class.java)
+                .putExtra(HistoryActivity.EXTRA_TAB, HistoryActivity.TAB_FAVORITE))
         }
         findViewById<TextView>(R.id.btn_log).setOnClickListener {
             startActivity(Intent(this, LogActivity::class.java))

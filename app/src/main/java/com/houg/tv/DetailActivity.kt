@@ -5,6 +5,7 @@ import android.os.Bundle
 import android.view.View
 import android.widget.ImageView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -17,7 +18,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-/** 详情页：封面 + 简介 + 选集 */
+/** 详情页：封面 + 简介 + 收藏按钮 + 选集（带续播定位） */
 class DetailActivity : AppCompatActivity() {
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
@@ -27,6 +28,7 @@ class DetailActivity : AppCompatActivity() {
     private lateinit var seriesCover: String
 
     private var episodes: List<NetClient.Episode> = emptyList()
+    private var lastEp = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -49,7 +51,27 @@ class DetailActivity : AppCompatActivity() {
                 .into(cover)
         }
 
+        updateFavoriteButton()
+        findViewById<View>(R.id.btn_favorite).setOnClickListener { toggleFavorite() }
+
         loadDetail()
+    }
+
+    private fun toggleFavorite() {
+        val now = App.watchHistory.toggleFavorite(seriesId, seriesTitle, seriesCover)
+        updateFavoriteButton()
+        Toast.makeText(
+            this,
+            if (now) R.string.favorite_added else R.string.favorite_removed,
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    private fun updateFavoriteButton() {
+        val btn = findViewById<TextView>(R.id.btn_favorite)
+        val fav = seriesId.isNotEmpty() && App.watchHistory.isFavorite(seriesId)
+        btn.text = if (fav) getString(R.string.favorited) else getString(R.string.favorite)
+        btn.isSelected = fav
     }
 
     private fun loadDetail() {
@@ -66,8 +88,12 @@ class DetailActivity : AppCompatActivity() {
                 episodes = detail.episodes
                 val titleView = findViewById<TextView>(R.id.detail_title)
                 titleView.text = detail.title
+                // 详情接口拿到的标题/封面比列表页更准，回填给收藏与历史用
+                if (detail.title.isNotEmpty()) seriesTitle = detail.title
+                if (detail.cover.isNotEmpty()) seriesCover = detail.cover
                 val meta = findViewById<TextView>(R.id.detail_meta)
-                meta.text = getString(R.string.episode_count, episodes.size.toString())
+                val countText = getString(R.string.episode_count, episodes.size.toString())
+                meta.text = countText
                 val intro = findViewById<TextView>(R.id.detail_intro)
                 intro.text = detail.intro
                 if (detail.cover.isNotEmpty()) {
@@ -77,17 +103,37 @@ class DetailActivity : AppCompatActivity() {
                         .into(findViewById(R.id.detail_cover))
                 }
 
-                val lastEp = App.watchHistory.lastEpisode(seriesId)
+                lastEp = App.watchHistory.lastEpisode(seriesId)
+                // 详情接口拿到的标题/封面更权威，若已收藏则**原地**刷新收藏项元数据
+                // （不动收藏时间，避免"只是看了下详情"就把该剧顶到收藏列表最前）
+                App.watchHistory.updateFavoriteMeta(seriesId, seriesTitle, seriesCover)
+
+                // 续播入口：有历史进度时在选集上方显示「继续观看 第N集」
+                val resumeBtn = findViewById<TextView>(R.id.btn_resume)
+                if (lastEp > 0 && episodes.isNotEmpty()) {
+                    resumeBtn.text = getString(R.string.continue_ep, lastEp.toString())
+                    resumeBtn.visibility = View.VISIBLE
+                    resumeBtn.setOnClickListener { resumePlay() }
+                } else {
+                    resumeBtn.visibility = View.GONE
+                }
+
                 val episodeAdapter = EpisodeAdapter(episodes, lastEp) { ep -> playEpisode(ep) }
                 val recycler = findViewById<RecyclerView>(R.id.episode_recycler)
                 recycler.layoutManager = GridLayoutManager(
                     this@DetailActivity, adaptiveGridColumns(this@DetailActivity, 100, 4, 12))
                 recycler.adapter = episodeAdapter
-                // 焦点移到选集列表，方便遥控器直接选集
+                // 焦点：优先落在「继续观看」，否则落在上次看的集，最后才落第 1 集
                 recycler.post {
-                    val holder = recycler.findViewHolderForAdapterPosition(0)
-                    if (holder != null) holder.itemView.requestFocus() else recycler.requestFocus()
+                    if (lastEp > 0 && resumeBtn.visibility == View.VISIBLE) {
+                        resumeBtn.requestFocus()
+                    } else {
+                        val idx = episodes.indexOfFirst { it.index == lastEp }.coerceAtLeast(0)
+                        val holder = recycler.findViewHolderForAdapterPosition(idx)
+                        if (holder != null) holder.itemView.requestFocus() else recycler.requestFocus()
+                    }
                 }
+                updateFavoriteButton()
 
                 if (episodes.isEmpty()) {
                     statusText.text = if (detail.title == seriesId) {
@@ -109,6 +155,12 @@ class DetailActivity : AppCompatActivity() {
                 progress.visibility = View.GONE
             }
         }
+    }
+
+    /** 「继续观看」：直接进入上次那集，播放器会自动 seek 到上次位置。 */
+    private fun resumePlay() {
+        val ep = episodes.firstOrNull { it.index == lastEp } ?: episodes.firstOrNull() ?: return
+        playEpisode(ep)
     }
 
     private fun playEpisode(ep: NetClient.Episode) {

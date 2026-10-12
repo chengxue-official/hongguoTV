@@ -39,6 +39,22 @@
             android:textStyle="bold"
             android:maxLines="1"
             android:ellipsize="end" />
+
+        <!-- 收藏按钮：文案在「收藏 / 已收藏」间切换，isSelected 控制高亮 -->
+        <TextView
+            android:id="@+id/btn_favorite"
+            android:layout_width="wrap_content"
+            android:layout_height="40dp"
+            android:layout_marginStart="12dp"
+            android:gravity="center"
+            android:paddingStart="18dp"
+            android:paddingEnd="18dp"
+            android:text="@string/favorite"
+            android:textColor="@color/text_primary"
+            android:textSize="15sp"
+            android:background="@drawable/button_favorite_bg"
+            android:focusable="true"
+            android:clickable="true" />
     </LinearLayout>
 
     <!-- 主体 -->
@@ -86,34 +102,59 @@
             </ScrollView>
         </LinearLayout>
 
-        <!-- 右侧：选集 -->
-        <FrameLayout
+        <!-- 右侧：继续观看 + 选集 -->
+        <LinearLayout
             android:layout_width="0dp"
             android:layout_height="match_parent"
             android:layout_weight="1"
-            android:layout_marginStart="20dp">
+            android:layout_marginStart="20dp"
+            android:orientation="vertical">
 
-            <androidx.recyclerview.widget.RecyclerView
-                android:id="@+id/episode_recycler"
-                android:layout_width="match_parent"
-                android:layout_height="match_parent"
-                android:clipToPadding="false" />
-
-            <ProgressBar
-                android:id="@+id/progress"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_gravity="center"
-                android:visibility="gone" />
-
+            <!-- 续播入口（有观看历史时显示） -->
             <TextView
-                android:id="@+id/status_text"
+                android:id="@+id/btn_resume"
                 android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_gravity="center"
-                android:textColor="@color/text_secondary"
+                android:layout_height="44dp"
+                android:gravity="center"
+                android:paddingStart="22dp"
+                android:paddingEnd="22dp"
+                android:text="@string/continue_watch"
+                android:textColor="@color/text_primary"
                 android:textSize="15sp"
+                android:background="@drawable/button_bg"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:clickable="true"
                 android:visibility="gone" />
-        </FrameLayout>
+
+            <FrameLayout
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1"
+                android:layout_marginTop="8dp">
+
+                <androidx.recyclerview.widget.RecyclerView
+                    android:id="@+id/episode_recycler"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:clipToPadding="false" />
+
+                <ProgressBar
+                    android:id="@+id/progress"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="center"
+                    android:visibility="gone" />
+
+                <TextView
+                    android:id="@+id/status_text"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="center"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="15sp"
+                    android:visibility="gone" />
+            </FrameLayout>
+        </LinearLayout>
     </LinearLayout>
 </LinearLayout>

@@ -42,7 +42,18 @@ class HistoryAdapter(
 
         fun bind(e: WatchHistory.Entry) {
             title.text = e.title
-            progress.text = "看到第 ${e.lastEp} 集"
+            val ctx = itemView.context
+            progress.text = if (e.lastEp > 0) {
+                val pos = e.positionOf(e.lastEp)
+                if (pos > 0) {
+                    ctx.getString(R.string.resume_hint, e.lastEp.toString(), formatMs(pos))
+                } else {
+                    ctx.getString(R.string.watched_ep, e.lastEp.toString())
+                }
+            } else {
+                // 收藏项（没有观看记录）
+                ctx.getString(R.string.favorited)
+            }
             if (e.cover.isNotEmpty()) {
                 Glide.with(itemView.context)
                     .load(e.cover)
@@ -55,6 +66,15 @@ class HistoryAdapter(
                 onLongClick(e)
                 true
             }
+        }
+
+        private fun formatMs(ms: Long): String {
+            val totalSec = ms / 1000
+            val h = totalSec / 3600
+            val m = (totalSec % 3600) / 60
+            val s = totalSec % 60
+            return if (h > 0) String.format(java.util.Locale.US, "%d:%02d:%02d", h, m, s)
+            else String.format(java.util.Locale.US, "%02d:%02d", m, s)
         }
     }
 }
