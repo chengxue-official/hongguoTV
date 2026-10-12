@@ -1,0 +1,222 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/black">
+
+    <!-- 视频画面：AspectRatioFrameLayout 按比例缩放，避免竖屏被拉宽 -->
+    <androidx.media3.ui.AspectRatioFrameLayout
+        android:id="@+id/video_container"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_gravity="center"
+        android:background="@color/black">
+
+        <SurfaceView
+            android:id="@+id/video_surface"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+    </androidx.media3.ui.AspectRatioFrameLayout>
+
+    <!-- 弹幕层（在视频之上、控制栏之下） -->
+    <com.houg.tv.DanmakuView
+        android:id="@+id/danmaku_view"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:clickable="false"
+        android:focusable="false"
+        android:visibility="gone" />
+
+    <!-- 加载中 -->
+    <ProgressBar
+        android:id="@+id/progress"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:visibility="gone" />
+
+    <!-- 错误提示 -->
+    <TextView
+        android:id="@+id/error_text"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:textColor="@color/text_secondary"
+        android:textSize="15sp"
+        android:visibility="gone" />
+
+    <!-- 播放栏 -->
+    <LinearLayout
+        android:id="@+id/control_bar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:orientation="vertical"
+        android:padding="16dp"
+        android:background="#CC000000">
+
+        <SeekBar
+            android:id="@+id/seek_bar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:focusable="true"
+            android:focusableInTouchMode="true"
+            android:nextFocusDown="@id/btn_play_pause"
+            android:background="@drawable/seek_bar_focus"
+            android:paddingTop="6dp"
+            android:paddingBottom="6dp"
+            android:max="1000" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <TextView
+                android:id="@+id/btn_prev"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:gravity="center"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:text="上一集"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp"
+                android:background="@drawable/button_bg"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:nextFocusUp="@id/seek_bar"
+                android:nextFocusRight="@id/btn_play_pause"
+                android:nextFocusDown="@id/btn_next"
+                android:clickable="true" />
+
+            <TextView
+                android:id="@+id/btn_play_pause"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:layout_marginStart="10dp"
+                android:gravity="center"
+                android:paddingStart="16dp"
+                android:paddingEnd="16dp"
+                android:text="暂停"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp"
+                android:background="@drawable/button_bg"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:nextFocusUp="@id/seek_bar"
+                android:nextFocusLeft="@id/btn_prev"
+                android:nextFocusRight="@id/btn_next"
+                android:nextFocusDown="@id/btn_next"
+                android:clickable="true" />
+
+            <TextView
+                android:id="@+id/btn_next"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:layout_marginStart="10dp"
+                android:gravity="center"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:text="下一集"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp"
+                android:background="@drawable/button_bg"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:nextFocusUp="@id/seek_bar"
+                android:nextFocusLeft="@id/btn_play_pause"
+                android:nextFocusRight="@id/btn_exit"
+                android:nextFocusDown="@id/btn_play_pause"
+                android:clickable="true" />
+
+            <TextView
+                android:id="@+id/episode_info"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:layout_marginStart="14dp"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/btn_exit"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:gravity="center"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:text="@string/back"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp"
+                android:background="@drawable/button_bg"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:nextFocusUp="@id/seek_bar"
+                android:nextFocusLeft="@id/btn_next"
+                android:nextFocusRight="@id/btn_aspect"
+                android:nextFocusDown="@id/btn_danmaku"
+                android:clickable="true" />
+
+            <TextView
+                android:id="@+id/btn_aspect"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:layout_marginStart="10dp"
+                android:gravity="center"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:text="@string/aspect_ratio"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp"
+                android:background="@drawable/button_bg"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:nextFocusUp="@id/seek_bar"
+                android:nextFocusLeft="@id/btn_exit"
+                android:nextFocusRight="@id/btn_speed"
+                android:nextFocusDown="@id/btn_danmaku"
+                android:clickable="true" />
+
+            <TextView
+                android:id="@+id/btn_speed"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:layout_marginStart="10dp"
+                android:gravity="center"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:text="倍速"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp"
+                android:background="@drawable/button_bg"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:nextFocusUp="@id/seek_bar"
+                android:nextFocusLeft="@id/btn_aspect"
+                android:nextFocusRight="@id/btn_danmaku"
+                android:nextFocusDown="@id/btn_danmaku"
+                android:clickable="true" />
+
+            <TextView
+                android:id="@+id/btn_danmaku"
+                android:layout_width="wrap_content"
+                android:layout_height="36dp"
+                android:layout_marginStart="10dp"
+                android:gravity="center"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:text="弹幕"
+                android:textColor="@color/text_primary"
+                android:textSize="14sp"
+                android:background="@drawable/button_bg"
+                android:focusable="true"
+                android:focusableInTouchMode="true"
+                android:nextFocusUp="@id/seek_bar"
+                android:nextFocusLeft="@id/btn_speed"
+                android:nextFocusDown="@id/btn_play_pause"
+                android:clickable="true" />
+        </LinearLayout>
+    </LinearLayout>
+</FrameLayout>
