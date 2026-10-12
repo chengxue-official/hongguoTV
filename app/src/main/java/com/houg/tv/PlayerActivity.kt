@@ -19,6 +19,7 @@ import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
+import androidx.lifecycle.Lifecycle
 import com.houg.tv.net.HttpClientProvider
 import com.houg.tv.net.NetClient
 import com.houg.tv.playback.CencMp4Downloader
@@ -33,6 +34,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.RandomAccessFile
 
 /**
  * 播放器：ExoPlayer（media3），下载→CENC 解密去封装→播本地明文 mp4（HEVC hvc1 + AAC）。
@@ -61,13 +63,16 @@ class PlayerActivity : AppCompatActivity() {
     /** 视频真实宽高（onVideoSizeChanged 回调，未解析前为 0） */
     private var videoWidth = 0
     private var videoHeight = 0
-    /** 旋转角与像素宽高比：竖屏短剧常带 90° 旋转元数据，不处理会横向铺满（人被拉胖） */
-    private var videoRotation = 0
-    private var pixelRatio = 1f
-    /** 从 mp4 tkhd 解析的显示宽高与旋转角（prepareClearFile 后设置，优先于 ExoPlayer 回调） */
+    /** 从 mp4 tkhd 解析的显示宽高与旋转角（解密/缓存命中后设置，优先于 ExoPlayer 回调） */
     private var tkhdWidth = 0
     private var tkhdHeight = 0
     private var tkhdRotation = 0
+    /**
+     * 应播放状态：区分「用户主动暂停」与「起播过程中被切到后台」。
+     * 起播完成时若已不可见则不应 auto-play；回前台时据此恢复，避免把用户
+     * 手动暂停的播放强行续起。
+     */
+    private var shouldBePlaying = true
     /** 当前画幅模式下标，见 ASPECT_MODES */
     private var aspectMode = 0
 
@@ -99,20 +104,19 @@ class PlayerActivity : AppCompatActivity() {
         }
 
         override fun onVideoSizeChanged(size: androidx.media3.common.VideoSize) {
-            videoWidth = size.width
-            videoHeight = size.height
-            // tkhd 解析结果优先：竖屏短剧带 90° 旋转元数据时 ExoPlayer 回调的
-            // width/height 已是旋转后的（部分老 ROM 解码器不旋转），但保险起见
-            // 以 mp4 tkhd 的显示宽高为准
+            // tkhd 解析结果优先（解密时已拿到，含旋转元数据）；无 tkhd 时回退 ExoPlayer 回调
             if (tkhdWidth > 0 && tkhdHeight > 0) {
                 if (tkhdRotation == 90 || tkhdRotation == 270) {
-                    // 竖屏视频：显示宽高互换后仍是竖条，直接用
-                    videoWidth = tkhdWidth
-                    videoHeight = tkhdHeight
+                    // 竖屏旋转流：tkhd 原始宽高是横向的（如 1920x1080），显示时需互换
+                    videoWidth = tkhdHeight
+                    videoHeight = tkhdWidth
                 } else {
                     videoWidth = tkhdWidth
                     videoHeight = tkhdHeight
                 }
+            } else {
+                videoWidth = size.width
+                videoHeight = size.height
             }
             applyAspectRatio()
         }
@@ -219,7 +223,13 @@ class PlayerActivity : AppCompatActivity() {
         playGen++
         val gen = playGen
 
-        // 切集/起播时清空弹幕缓存、画幅元数据与预加载状态（下一集可能横竖屏不同）
+        // 切集时取消在途的预加载任务：它下载的是「按旧的下一集算出的目标」，
+        // 继续跑只会白抢带宽（且可能与本集写出同一个文件）。
+        // 注意：不删已下载的缓存文件，留给 findCachedClearFile 命中。
+        prefetchJob?.cancel()
+        prefetchJob = null
+
+        // 切集/起播时清空弹幕缓存与画幅元数据（下一集可能横竖屏不同）
         danmakuFetchedWindows.clear()
         lastDanmakuWindow = -1L
         danmakuView.reset()
@@ -238,7 +248,8 @@ class PlayerActivity : AppCompatActivity() {
                 if (cached != null) {
                     if (gen != playGen) return@launch
                     AppLog.d("PlayerActivity", "命中预加载缓存 vid=$vid")
-                    parseTkhd(cached.readBytes())
+                    withContext(Dispatchers.IO) { parseTkhd(cached) }
+                    if (gen != playGen) return@launch
                     startPlayback(cached)
                     return@launch
                 }
@@ -279,9 +290,9 @@ class PlayerActivity : AppCompatActivity() {
                     val t0 = System.currentTimeMillis()
                     val enc = downloader.downloadWithRetry(v.urls)
                     val clear = CencMp4Remuxer.remux(enc, v.cencKey)
-                    parseTkhd(clear)
                     val file = File(cacheDir, "clear_" + video.videoId + ".mp4")
                     file.writeBytes(clear)
+                    parseTkhd(file)
                     AppLog.d("PlayerActivity", "prepareClearFile codec=" + v.codec
                             + " height=" + v.height + " enc=" + enc.size
                             + " clear=" + clear.size + " 耗时(ms)=" + (System.currentTimeMillis() - t0)
@@ -296,9 +307,9 @@ class PlayerActivity : AppCompatActivity() {
             try {
                 val enc = downloader.downloadWithRetry(video.urls)
                 val clear = CencMp4Remuxer.remux(enc, video.cencKey)
-                parseTkhd(clear)
                 val file = File(cacheDir, "clear_" + video.videoId + ".mp4")
                 file.writeBytes(clear)
+                parseTkhd(file)
                 return file
             } catch (e: Exception) {
                 AppLog.e("PlayerActivity", "下载/解密失败", e)
@@ -307,12 +318,26 @@ class PlayerActivity : AppCompatActivity() {
         throw Exception("视频下载或解密失败")
     }
 
-    /** 从解密后的 mp4 解析 tkhd 显示宽高与旋转角（用于竖屏画幅适配）。 */
-    private fun parseTkhd(clear: ByteArray) {
+    /**
+     * 从解密后的 mp4 解析 tkhd 显示宽高与旋转角（用于竖屏画幅适配）。
+     * 只读文件头部（moov 通常在前 256KB 内），不整文件载入内存（单集约 10MB）。
+     */
+    private fun parseTkhd(clear: File) {
         try {
-            val top = CencMp4Parser.parse(clear, 0, clear.size)
+            val head = ByteArray(MOOV_PROBE_BYTES)
+            // read() 单次可能不满读（moov 需 ~104KB），循环读满
+            var read = 0
+            RandomAccessFile(clear, "r").use { r ->
+                while (read < head.size) {
+                    val n = r.read(head, read, head.size - read)
+                    if (n < 0) break
+                    read += n
+                }
+            }
+            if (read <= 0) return
+            val top = CencMp4Parser.parse(head, 0, read)
             for (trak in CencMp4Parser.findRecursive(top, "trak")) {
-                val g = CencMp4Parser.displayGeometry(clear, trak)
+                val g = CencMp4Parser.displayGeometry(head, trak)
                 // 只取视频轨（宽高非 0 的那条；音频轨宽高为 0）
                 if (g.width > 0 && g.height > 0) {
                     tkhdWidth = g.width
@@ -331,7 +356,15 @@ class PlayerActivity : AppCompatActivity() {
         p.setMediaItem(MediaItem.fromUri(Uri.fromFile(file)))
         p.prepare()
         applySpeed()
-        p.playWhenReady = true
+        // 关键：起播过程中若已切到后台（用户按了主页），不能 auto-play，否则会
+        // 在后台出声——这正是用户反馈的「返回后还有声音」。等回前台再续播。
+        if (isVisibleNow()) {
+            p.playWhenReady = true
+            shouldBePlaying = true
+        } else {
+            p.playWhenReady = false
+            shouldBePlaying = false
+        }
         if (resumePosition > 0) {
             p.seekTo(resumePosition.toLong())
             resumePosition = 0
@@ -339,6 +372,15 @@ class PlayerActivity : AppCompatActivity() {
         progress.visibility = View.GONE
         updatePlayPauseButton()
         recordHistory()
+    }
+
+    /** Activity 是否处于可见（已开始）状态；onStop 之前视为可见。 */
+    private fun isVisibleNow(): Boolean {
+        return try {
+            lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+        } catch (_: Exception) {
+            true
+        }
     }
 
     private fun togglePlayPause() {
@@ -405,8 +447,6 @@ class PlayerActivity : AppCompatActivity() {
         danmakuView.setPlaying(p.isPlaying)
         danmakuView.setRate(SPEEDS[speedIndex])
         if (dur <= 0) return
-        // 播放进度走到 80% 时预加载下一集（取流+下载+解密），消除切集卡顿
-        if (dur > 0 && pos >= dur * 4 / 5) prefetchNext()
         val window = pos / DANMAKU_WINDOW_MS * DANMAKU_WINDOW_MS
         if (window == lastDanmakuWindow) return
         lastDanmakuWindow = window
@@ -416,7 +456,8 @@ class PlayerActivity : AppCompatActivity() {
 
     /**
      * 预加载下一集：提前请求 videoModel 并下载解密到本地缓存文件。
-     * 切集时若缓存命中则跳过网络直接起播。用 prefetchGen 防重复、防旧任务覆盖。
+     * 切集时若缓存命中则跳过网络直接起播。
+     * 失败后只在切集/换集时才会重新触发，不做 500ms 级重试（避免请求风暴被风控）。
      */
     private fun prefetchNext() {
         val nextPos = currentPos + 1
@@ -464,11 +505,9 @@ class PlayerActivity : AppCompatActivity() {
                 if (gen != playGen) return@launch
                 AppLog.d("PlayerActivity", "预加载完成 pos=$nextPos file=${file?.name}")
             } catch (e: Exception) {
-                if (gen == playGen) {
-                    // 预加载失败不打扰用户，切集时走正常路径重试
-                    AppLog.d("PlayerActivity", "预加载失败 pos=$nextPos: " + (e.message ?: ""))
-                    prefetchedPos = -1
-                }
+                // 失败不打扰用户：切集时走正常路径（playCurrent 会重新取流）。
+                // 注意不要把 prefetchedPos 复位，否则每 500ms 会重试一次形成请求风暴。
+                AppLog.d("PlayerActivity", "预加载失败 pos=$nextPos: " + (e.message ?: ""))
             }
         }
     }
@@ -531,9 +570,10 @@ class PlayerActivity : AppCompatActivity() {
         }
         currentPos = pos
         resumePosition = 0
-        // 停止上一集并清理旧的明文临时文件，避免取流窗口期误记旧集进度
+        // 停止上一集；只清理「非当前集、非下一集」的明文临时文件。
+        // 关键：不能整目录删——新集若已预加载，删掉会让缓存永远命中不了（预加载失效）。
         releasePlayer()
-        cleanupClearFiles()
+        cleanupClearFiles(keep = setOf(vidList.getOrNull(pos), vidList.getOrNull(pos + 1)))
         playCurrent()
         showControls()
     }
@@ -569,11 +609,19 @@ class PlayerActivity : AppCompatActivity() {
         }
     }
 
-    /** 删除 cacheDir 下所有 clear_ 前缀的明文临时文件。 */
-    private fun cleanupClearFiles() {
+    /**
+     * 删除 cacheDir 下 clear_ 前缀的明文临时文件。
+     * @param keep 需保留的 vid 集合（当前集与预加载的下一集）；为 null 时全清。
+     */
+    private fun cleanupClearFiles(keep: Set<String?>? = null) {
         try {
             cacheDir.listFiles()?.forEach { f ->
-                if (f.name.startsWith("clear_")) f.delete()
+                if (!f.name.startsWith("clear_")) return@forEach
+                if (keep != null) {
+                    val name = f.name.removePrefix("clear_").removeSuffix(".mp4")
+                    if (keep.contains(name)) return@forEach
+                }
+                f.delete()
             }
         } catch (_: Exception) {
         }
@@ -626,6 +674,9 @@ class PlayerActivity : AppCompatActivity() {
                 if (dur > 0) {
                     seekBar.max = 1000
                     seekBar.progress = (pos * 1000 / dur).toInt()
+                    // 播放到 80% 时预加载下一集。放在这里而非弹幕函数内，
+                    // 避免「关闭弹幕导致预加载一并失效」。
+                    if (pos >= dur * 4 / 5) prefetchNext()
                 }
                 updateDanmaku(p, pos, dur)
             }
@@ -713,8 +764,10 @@ class PlayerActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
-        // 用户反馈：按主页返回后后台还在出声音。Activity 不可见时必须暂停
-        //（recordHistory 记录进度，回前台 onResume 恢复播放）
+        // 用户反馈：按主页返回后后台还在出声音。Activity 不可见时必须暂停。
+        // shouldBePlaying 记录「用户意图」，回前台据此决定是否自动续播——
+        // 避免把用户手动暂停的播放强行续起。
+        shouldBePlaying = player?.isPlaying == true
         resumePosition = try {
             val p = player
             if (p != null && p.duration > 0) p.currentPosition.toInt() else 0
@@ -728,17 +781,17 @@ class PlayerActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        // 从后台/按主页返回后回前台：从记录位置续播
+        val p = player ?: return
+        // 从后台/按主页返回后回前台：回到原位并仅在「用户意图是播放」时续播
         if (resumePosition > 0) {
             try {
-                val p = player ?: return
                 if (p.duration > 0) p.seekTo(resumePosition.toLong())
             } catch (_: Exception) {
             }
             resumePosition = 0
         }
-        if (player != null && player!!.playbackState != Player.STATE_IDLE) {
-            player?.play()
+        if (shouldBePlaying && p.playbackState != Player.STATE_IDLE) {
+            p.play()
             updatePlayPauseButton()
         }
     }
@@ -767,6 +820,9 @@ class PlayerActivity : AppCompatActivity() {
         private const val PREF_SPEED = "playback_speed"
         private const val PREF_DANMAKU = "danmaku_enabled"
         private const val DANMAKU_WINDOW_MS = 30000L
+
+        /** tkhd 解析时读取的文件头长度（moov 通常在前 256KB 内）。 */
+        private const val MOOV_PROBE_BYTES = 256 * 1024
 
         /** 倍速档位 */
         private val SPEEDS = floatArrayOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)

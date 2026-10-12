@@ -100,7 +100,10 @@ class DetailActivity : AppCompatActivity() {
                     statusText.visibility = View.VISIBLE
                 }
             } catch (e: Exception) {
-                statusText.text = e.message ?: getString(R.string.load_failed)
+                // 「已下架」类业务异常直接显示；网络类异常显示通用重试文案
+                val msg = e.message ?: ""
+                statusText.text = if (msg.contains("下架")) msg
+                    else getString(R.string.load_failed)
                 statusText.visibility = View.VISIBLE
             } finally {
                 progress.visibility = View.GONE
