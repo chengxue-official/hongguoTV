@@ -1,0 +1,9 @@
+{
+  // 静态资源目录：public/ 下的文件按原路径对外提供
+  // public/update.json -> https://<你的域名>/update.json
+  "name": "hongguotv",
+  "compatibility_date": "2026-10-12",
+  "assets": {
+    "directory": "./public"
+  }
+}
