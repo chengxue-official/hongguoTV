@@ -4,6 +4,12 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!--
+      热更新必需：Android 8.0(API 26)+ 安装 APK 需要此权限，否则
+      canRequestPackageInstalls() 恒为 false、设置页也无开关，下载完装不上。
+      （Android 6/7 走「未知来源」总开关，不依赖它）
+    -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <uses-feature android:name="android.software.leanback" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />

@@ -32,10 +32,10 @@ import java.io.File
 object UpdateChecker {
 
     /**
-     * Cloudflare Pages 域名（用户配好后填这里，形如 https://hongguotv.pages.dev）。
-     * 空 = 未配置，「检查更新」会提示。
+     * Cloudflare 托管域名（Workers 静态资源）。注意：*.workers.dev 在国内部分
+     * 网络下不可达，若电视上「检查失败」需在 Cloudflare 绑定自定义域名后换这里。
      */
-    const val HOST = ""
+    const val HOST = "https://hongguotv.moyushen.workers.dev"
 
     private fun updateUrl(): String = HOST.trimEnd('/') + "/update.json"
 
