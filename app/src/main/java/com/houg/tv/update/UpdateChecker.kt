@@ -32,10 +32,13 @@ import java.io.File
 object UpdateChecker {
 
     /**
-     * Cloudflare 托管域名（Workers 静态资源）。注意：*.workers.dev 在国内部分
-     * 网络下不可达，若电视上「检查失败」需在 Cloudflare 绑定自定义域名后换这里。
+     * 更新托管域名。已从 *.workers.dev（国内被 DNS 污染+封锁，电视端不可达）
+     * 切换为自定义域名 hongguo.kdns.fr（KataBump 免费二级域名，NS 托管到
+     * Cloudflare，绑定 hongguotv Worker 静态资源）。
+     * 注意：v1.0.1 及更早客户端仍指向 workers.dev，收不到本次推送，
+     * 需手动安装一次 1.0.2+ 的 APK 后才能走自动更新。
      */
-    const val HOST = "https://hongguotv.moyushen.workers.dev"
+    const val HOST = "https://hongguo.kdns.fr"
 
     private fun updateUrl(): String = HOST.trimEnd('/') + "/update.json"
 

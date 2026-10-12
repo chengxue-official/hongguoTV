@@ -14,8 +14,8 @@ android {
         // 适配 Android 5.0（API 21）及以上：红果片源为 HEVC+CENC，需 API 21 起的 HEVC 硬解能力
         minSdk = 21
         targetSdk = 35
-        versionCode = 101
-        versionName = "1.0.1"
+        versionCode = 103
+        versionName = "1.0.3"
     }
 
     // 传统 View 体系，不使用 Compose
