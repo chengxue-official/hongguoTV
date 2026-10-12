@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>红果短剧 TV · 更新服务器</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #14161a; color: #e8eaed;
+    font: 15px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  .card {
+    width: min(560px, 92vw); padding: 32px 36px;
+    background: #1c1f24; border: 1px solid #2a2f37; border-radius: 14px;
+  }
+  h1 { margin: 0 0 4px; font-size: 20px; }
+  .sub { color: #9aa0a6; font-size: 13px; margin-bottom: 24px; }
+  .ver { font-size: 30px; font-weight: 700; color: #ff4d4f; margin: 8px 0 20px; }
+  .ver small { font-size: 14px; font-weight: 400; color: #9aa0a6; margin-left: 6px; }
+  dl { margin: 0; display: grid; grid-template-columns: 88px 1fr; gap: 8px 14px; font-size: 13px; }
+  dt { color: #9aa0a6; }
+  dd { margin: 0; word-break: break-all; }
+  a { color: #6ab0ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .ok { color: #52c41a; }
+  .err { color: #ff7875; }
+  .footer { margin-top: 24px; padding-top: 16px; border-top: 1px solid #2a2f37; color: #6b7280; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>红果短剧 TV · 更新服务器</h1>
+  <div class="sub">热更新分发包托管（Cloudflare Workers 静态资源）</div>
+
+  <div class="ver" id="ver">加载中…<small id="vname"></small></div>
+
+  <dl>
+    <dt>清单</dt>
+    <dd><a href="./update.json">update.json</a></dd>
+    <dt>安装包</dt>
+    <dd id="apk">—</dd>
+    <dt>更新说明</dt>
+    <dd id="notes">—</dd>
+    <dt>状态</dt>
+    <dd id="status">检查中…</dd>
+  </dl>
+
+  <div class="footer">
+    本页仅供人工核对版本与文件是否正常。App 端只读取 <code>update.json</code>。
+  </div>
+</div>
+
+<script>
+(async function () {
+  const $ver = document.getElementById('ver');
+  const $vname = document.getElementById('vname');
+  const $apk = document.getElementById('apk');
+  const $notes = document.getElementById('notes');
+  const $status = document.getElementById('status');
+  try {
+    const res = await fetch('./update.json?t=' + Date.now());
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const m = await res.json();
+    $ver.childNodes[0].nodeValue = 'v' + (m.versionName || '?');
+    $vname.textContent = 'versionCode ' + (m.versionCode ?? '?');
+    $apk.innerHTML = '<a href="./' + m.apk + '">' + m.apk + '</a>';
+    $notes.textContent = m.notes || '—';
+
+    // 顺带探测安装包是否真的可下载（只取前 1KB）
+    const head = await fetch('./' + m.apk, { headers: { Range: 'bytes=0-1023' } });
+    const len = head.headers.get('content-range') || head.headers.get('content-length') || '?';
+    $status.innerHTML = head.ok
+      ? '<span class="ok">正常</span> · 安装包可下载（' + len + '）'
+      : '<span class="err">安装包异常 HTTP ' + head.status + '</span>';
+  } catch (e) {
+    $ver.childNodes[0].nodeValue = '读取失败';
+    $status.innerHTML = '<span class="err">' + e.message + '</span>';
+  }
+})();
+</script>
+</body>
+</html>
