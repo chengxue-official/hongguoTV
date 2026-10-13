@@ -1042,6 +1042,9 @@ class PlayerActivity : AppCompatActivity() {
         val p = player ?: return
         val dur = p.duration
         if (dur <= 0) return
+        // 用户已手动操作进度：作废待执行的续播 seek，避免 STATE_READY 回调
+        // 把用户刚拖到的位置又覆盖回续播点（READY 晚于按键到达的竞态）。
+        pendingResumeMs = 0L
         val step = QUICK_SEEK_MS * (1 + repeatCount.coerceAtMost(MAX_SEEK_REPEAT).toLong())
         val target = (p.currentPosition + dir * step).coerceIn(0L, dur)
         p.seekTo(target)
