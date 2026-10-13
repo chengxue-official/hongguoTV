@@ -1,9 +1,21 @@
 {
-  // 静态资源目录：public/ 下的文件按原路径对外提供
-  // public/update.json -> https://<你的域名>/update.json
+  // HougTime 分发 Worker：静态资源（update.json / APK）+ 日志托管 API
+  // - 静态资源：public/ 下文件按原路径对外提供（/update.json、/hongguo-1.0.x.apk）
+  // - 日志 API：POST /api/log 上传、GET /log/<token> 在线查看、GET /log/<token>.txt 下载
   "name": "hongguotv",
+  "main": "src/index.js",
   "compatibility_date": "2026-10-12",
   "assets": {
-    "directory": "./public"
-  }
+    "directory": "./public",
+    // 未被 Worker 路由命中的请求走静态资源；/api/log 与 /log/* 由脚本处理
+    "binding": "ASSETS"
+  },
+  // 日志存储 KV：创建后把 id 替换为真实值
+  // npx wrangler kv namespace create LOGS
+  "kv_namespaces": [
+    {
+      "binding": "LOGS",
+      "id": "a7c4465ab4fa4ffe87ff9aafce8392e2"
+    }
+  ]
 }
