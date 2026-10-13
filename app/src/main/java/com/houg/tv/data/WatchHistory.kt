@@ -71,6 +71,32 @@ class WatchHistory(context: Context) {
         }
     }
 
+    /**
+     * 标记某集「已看完」：清空该集进度（下次进入从头播），并把 lastEp 推进到该集。
+     *
+     * ⚠️ 必须清空进度：一集播完时若把「片尾位置」留作续播点，用户再次进入该集会被
+     * seek 到片尾，立刻触发 STATE_ENDED → 又被判为播完 → 自动跳下一集；而下一集的
+     * 片尾位置同样被留下，于是连环跳集、周而复始（用户反馈的恶性 bug）。
+     */
+    fun markEpisodeCompleted(seriesId: String, title: String, cover: String, ep: Int) {
+        if (seriesId.isEmpty() || ep <= 0) return
+        synchronized(lock) {
+            val map = loadAll(KEY).toMutableMap()
+            val old = map[seriesId]
+            val positions = HashMap<Int, Long>(old?.positions ?: emptyMap())
+            positions.remove(ep)
+            map[seriesId] = Entry(
+                seriesId,
+                title.ifEmpty { old?.title ?: "" },
+                cover.ifEmpty { old?.cover ?: "" },
+                ep,
+                System.currentTimeMillis(),
+                positions
+            )
+            saveAll(KEY, map)
+        }
+    }
+
     /** 上次在第 ep 集的播放位置（ms）；没有记录返回 0。 */
     fun positionOf(seriesId: String, ep: Int): Long {
         synchronized(lock) {

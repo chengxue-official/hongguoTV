@@ -44,7 +44,7 @@ import java.util.Locale
  *  - 左右键          ：快退 / 快进 15 秒；长按按键重复事件会叠加步长（15s→30s→45s…）
  *  - 上 / 下键       ：上一集 / 下一集
  *  - 菜单键          ：调出菜单（画面填充、弹幕开关、倍速、退出）
- *  - 返回键          ：继续播放 / 退出播放
+ *  - 返回键          ：双击退出（首次提示，2 秒内再按一次退出播放）
  *  - 任意按键        ：短暂显示顶部集信息与底部进度（自动隐藏，不抢焦点）
  */
 class PlayerActivity : AppCompatActivity() {
@@ -85,6 +85,16 @@ class PlayerActivity : AppCompatActivity() {
 
     /** 本集起播时是否已经做过「续播 seek」（避免重复 seek 打断用户手动拖动） */
     private var resumedThisEpisode = false
+    /**
+     * 待执行的续播位置（ms）。
+     *
+     * ⚠️ 续播 seek 必须等 STATE_READY（duration 已知）再执行：prepare() 未完成时
+     * duration 返回 C.TIME_UNSET（大负数），此时无法判断「上次位置是否已接近片尾」。
+     * 旧实现在这里直接 seek，如果上次停在片尾附近（每集播完都会把片尾位置写进历史），
+     * seek 过去立刻抛 STATE_ENDED → 被判"播完"自动跳下一集 → 下一集同样带着片尾
+     * 续播点 → 连环跳集（用户反馈的恶性 bug）。
+     */
+    private var pendingResumeMs = 0L
     /** 正在切集：用于抑制切集瞬间的虚假 STATE_ENDED 回调 */
     private var switchingEpisode = false
     /** 本集起播是否已失败（解码/网络）。失败时上下键仍可切走，但不再自动跳集。 */
@@ -102,6 +112,8 @@ class PlayerActivity : AppCompatActivity() {
     }
     /** 上次写观看历史的时间戳（节流，避免 500ms 一次写盘） */
     private var lastHistoryWrite = 0L
+    /** 上次按返回键的时间戳（双击退出判定） */
+    private var lastBackPressed = 0L
 
     private lateinit var videoContainer: AspectRatioFrameLayout
     private lateinit var surfaceView: SurfaceView
@@ -135,7 +147,10 @@ class PlayerActivity : AppCompatActivity() {
                 // 真正就绪：此刻起才是可信的播放状态，解除切集抑制。
                 // 不能提前在 startPlayback() 末尾复位——prepare() 是异步的，
                 // 解码器初始化期的 STATE_ENDED 会在那之后才投递过来，抑制窗口太短会漏。
-                Player.STATE_READY -> releaseSwitchGuard()
+                Player.STATE_READY -> {
+                    releaseSwitchGuard()
+                    applyPendingResume()
+                }
                 Player.STATE_ENDED -> onEpisodeComplete()
             }
         }
@@ -296,6 +311,7 @@ class PlayerActivity : AppCompatActivity() {
         videoWidth = 0; videoHeight = 0
         prefetchedPos = -1
         resumedThisEpisode = false
+        pendingResumeMs = 0L
 
         updateEpisodeInfo()
         progress.visibility = View.VISIBLE
@@ -435,26 +451,14 @@ class PlayerActivity : AppCompatActivity() {
         p.prepare()
         applySpeed()
 
-        // 续播：本集若在观看历史里有进度，且不是刚开始（<5s），则从上次位置继续。
-        // 上界在 seek 前用 duration 判断：上次停在片尾附近时不能续播，否则一进去
-        // 立刻 ENDED 会自动跳下一集（观感像"点继续观看直接跳集"）。
+        // 续播：只在「本集尚未续播过」时计算一次待续播位置，真正的 seek 放到
+        // STATE_READY（duration 已知）里做——见 applyPendingResume()。
         if (!resumedThisEpisode) {
             resumedThisEpisode = true
-            val saved = try {
+            pendingResumeMs = try {
                 App.watchHistory.positionOf(seriesId, currentEpisode())
             } catch (_: Exception) {
                 0L
-            }
-            if (saved > RESUME_MIN_MS) {
-                val dur = p.duration
-                if (dur <= 0 || saved < dur - END_TOLERANCE_MS) {
-                    resumePosition = saved.toInt()
-                    AppLog.d("PlayerActivity", "续播命中 ep=${currentEpisode()} pos=${saved}ms")
-                } else {
-                    // 停在片尾附近：视为已看完，从头播
-                    resumePosition = 0
-                    AppLog.d("PlayerActivity", "上次位置接近片尾，从头播 saved=$saved dur=$dur")
-                }
             }
         }
 
@@ -467,16 +471,43 @@ class PlayerActivity : AppCompatActivity() {
             p.playWhenReady = false
             shouldBePlaying = false
         }
-        if (resumePosition > 0) {
-            val savedPos = resumePosition.toLong()
-            p.seekTo(savedPos)
-            resumePosition = 0
-            toast(getString(R.string.resume_hint, currentEpisode().toString(), formatMs(savedPos)))
-        }
         progress.visibility = View.GONE
         recordHistory(force = true)
         // 注意：switchingEpisode 由 playerListener 在收到 STATE_READY 时复位，
         // 覆盖到解码器初始化完成那一刻（比在这里复位更安全）。
+    }
+
+    /**
+     * STATE_READY 回调里执行待续播 seek。
+     *
+     * 此时 duration 已可信，可安全判断上界：上次位置若已接近片尾（说明这集其实
+     * 已经看完，只是历史里留了个片尾位置），则从头播——否则 seek 过去会立刻
+     * STATE_ENDED 并被误判为「播完」而自动跳下一集。
+     */
+    private fun applyPendingResume() {
+        val p = player ?: return
+        val saved = pendingResumeMs
+        pendingResumeMs = 0L
+        if (saved <= RESUME_MIN_MS) return
+        val dur = p.duration
+        // ⚠️ 片尾判定要用「续播余量」而非「播完容差」：END_TOLERANCE_MS 只有 1.5s，
+        // 意味着上次停在「距片尾 4 秒」处仍会续播——可用户刚进去还没来得及看，
+        // 4 秒后 STATE_ENDED 就触发自动跳下一集，观感仍是"点进去就跳集"。
+        // 短剧单集普遍只有 1~2 分钟，用 15 秒（或时长的 10%，取小）作余量：
+        // 剩余不足这么多就认为这集其实已看完，直接从头播。
+        val margin = minOf(RESUME_TAIL_MARGIN_MS, dur / 10).coerceAtLeast(END_TOLERANCE_MS)
+        if (dur > 0 && saved >= dur - margin) {
+            AppLog.d("PlayerActivity", "上次位置接近片尾，从头播 saved=$saved dur=$dur margin=$margin")
+            try { p.seekTo(0L) } catch (_: Exception) {}
+            return
+        }
+        try {
+            p.seekTo(saved)
+        } catch (_: Exception) {
+            return
+        }
+        AppLog.d("PlayerActivity", "续播命中 ep=${currentEpisode()} pos=${saved}ms")
+        toast(getString(R.string.resume_hint, currentEpisode().toString(), formatMs(saved)))
     }
 
     /** Activity 是否处于可见（已开始）状态；onStop 之前视为可见。 */
@@ -731,13 +762,28 @@ class PlayerActivity : AppCompatActivity() {
             AppLog.d("PlayerActivity", "忽略虚假 STATE_ENDED pos=$pos dur=$dur")
             return
         }
-        recordHistory(force = true)
+        // 本集确实播完：清掉本集进度（而非存片尾位置）。
+        // 若把片尾位置留作续播点，用户下次进这集会被 seek 到片尾 → 立刻又
+        // STATE_ENDED → 又自动跳下一集，而下一集的片尾位置同样被留下，形成
+        // 「周而复始自动跳集」（用户反馈的恶性 bug）。markEpisodeCompleted 会
+        // 清空该集进度并把 lastEp 推进到本集。
+        markEpisodeCompleted()
         if (currentPos + 1 < vidList.size) {
             switchEpisode(currentPos + 1)
         } else {
             // 末集播完：不再自动退出（那是"闪退回选集"的观感），停在原地给提示
             toast(getString(R.string.ep_played_out))
             showControls()
+        }
+    }
+
+    /** 标记当前集已看完：清空该集进度，避免下次进入又被 seek 到片尾连跳。 */
+    private fun markEpisodeCompleted() {
+        if (seriesId.isEmpty()) return
+        try {
+            App.watchHistory.markEpisodeCompleted(seriesId, title, cover, currentEpisode())
+        } catch (e: Exception) {
+            AppLog.e("PlayerActivity", "标记看完失败", e)
         }
     }
 
@@ -756,13 +802,26 @@ class PlayerActivity : AppCompatActivity() {
         if (seriesId.isEmpty()) return
         val now = System.currentTimeMillis()
         if (!force && now - lastHistoryWrite < HISTORY_WRITE_INTERVAL_MS) return
-        lastHistoryWrite = now
         val p = player
-        val posMs = try {
+        // 读位置（prepare 未完成时 duration<=0，读作 0 表示"本次拿不到有效位置"）
+        var posMs = try {
             if (p != null && p.duration > 0) p.currentPosition else 0L
         } catch (_: Exception) {
             0L
         }
+        // ⚠️ 接近片尾的位置一律不写入历史。否则该位置会成为下次的续播点，
+        // 用户再进这集就被 seek 到片尾 → 立刻 STATE_ENDED → 自动跳下一集，
+        // 而下一集同样留下片尾位置 → 连环跳集（用户反馈的恶性 bug）。
+        // 这里"直接 return 不写"而非写 0：record() 对 <=0 是"保留旧值"语义，
+        // 写 0 清不掉，反而可能把更早的有效续播点保留下来造成误解。
+        if (posMs > 0) {
+            val dur = try { p?.duration ?: 0L } catch (_: Exception) { 0L }
+            if (dur > 0 && posMs >= dur - END_TOLERANCE_MS) {
+                lastHistoryWrite = now
+                return
+            }
+        }
+        lastHistoryWrite = now
         try {
             App.watchHistory.record(seriesId, title, cover, currentEpisode(), posMs)
         } catch (e: Exception) {
@@ -916,8 +975,8 @@ class PlayerActivity : AppCompatActivity() {
 
         when (keyCode) {
             KeyEvent.KEYCODE_BACK -> {
-                // 按返回键直接弹「继续播放 / 退出」对话框（对齐原版交互）
-                showExitDialog()
+                // 双击返回退出：与其他电视应用一致。首次按提示，2 秒内再按一次才退出。
+                onBackPressed2x()
                 return true
             }
             KeyEvent.KEYCODE_MENU -> {
@@ -986,8 +1045,8 @@ class PlayerActivity : AppCompatActivity() {
         val step = QUICK_SEEK_MS * (1 + repeatCount.coerceAtMost(MAX_SEEK_REPEAT).toLong())
         val target = (p.currentPosition + dir * step).coerceIn(0L, dur)
         p.seekTo(target)
-        // 只有往回跳时才需要重置弹幕窗口（往前跳旧窗口数据仍有效，避免重复拉取）；
-        // DanmakuView 收到位置回退会自行重置飞行态并重新派生。
+        // 往回跳时清掉已拉取窗口标记，允许重新拉取（往前跳旧窗口数据仍有效，避免重复请求）。
+        // DanmakuView.setPositionMs 会自行识别位置跳变并重基准在途弹幕，无需在此手动清理。
         if (dir < 0) {
             danmakuFetchedWindows.clear()
             lastDanmakuWindow = -1L
@@ -998,14 +1057,28 @@ class PlayerActivity : AppCompatActivity() {
         else getString(R.string.seek_backward, (step / 1000).toString() + "s"))
     }
 
+    /* ==================== 退出 ==================== */
+
     /**
-     * 退出确认对话框。用户反馈：选中进度条后按退出，选"继续播放"后
-     * 确定键失灵——根因是对话框关闭后焦点丢失。这里在继续播放后
-     * 显式把焦点恢复到菜单按钮。
+     * 双击返回退出：第一次按给出提示，[EXIT_INTERVAL_MS] 内再按一次才真正退出。
+     * 与主流电视应用（爱奇艺/腾讯视频 TV 版等）一致，避免「按一下返回就退出」的误操作。
+     */
+    private fun onBackPressed2x() {
+        val now = System.currentTimeMillis()
+        if (now - lastBackPressed < EXIT_INTERVAL_MS) {
+            finish()
+        } else {
+            lastBackPressed = now
+            toast(getString(R.string.press_again_to_exit))
+        }
+    }
+
+    /**
+     * 退出确认对话框（仅菜单里的「退出播放」入口使用）。
      *
-     * 返回不了首页修复：原设 cancelable(false) 导致部分 TV ROM 上对话框
-     * 按钮无初始焦点时，返回键也被吞，用户被困在播放页。改为 cancelable(true)
-     * （返回键可关闭对话框并恢复播放）+ onShow 显式聚焦「继续播放」按钮。
+     * 返回键已改为双击退出，不再走这里。原设 cancelable(false) 导致部分 TV ROM 上
+     * 对话框按钮无初始焦点时返回键被吞，用户被困在播放页；保持 cancelable(true) 并在
+     * onShow 显式聚焦「继续播放」。
      */
     private fun showExitDialog() {
         tracking = false
@@ -1110,8 +1183,17 @@ class PlayerActivity : AppCompatActivity() {
         private const val END_TOLERANCE_MS = 1500L
         /** 续播的最小进度：小于 5s 视为从头看 */
         private const val RESUME_MIN_MS = 5_000L
+        /**
+         * 续播的片尾余量：上次位置距片尾不足该值（或时长 10%，取小）时视为已看完，
+         * 从头播。若只留几秒余量，用户续播进去还没看清就 STATE_ENDED 自动跳集，
+         * 观感仍是"点进去就跳下一集"（用户反馈的恶性 bug 场景）。
+         */
+        private const val RESUME_TAIL_MARGIN_MS = 15_000L
         /** 播放中写观看历史的节流间隔 */
         private const val HISTORY_WRITE_INTERVAL_MS = 10_000L
+
+        /** 双击返回退出的时间窗口：2 秒内连按两次返回键直接退出 */
+        private const val EXIT_INTERVAL_MS = 2_000L
 
         /**
          * 切集抑制兜底时限：正常起播（含下载+解密）远快于此。

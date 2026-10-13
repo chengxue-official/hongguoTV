@@ -158,23 +158,39 @@ object UpdateChecker {
         }
     }
 
-    /** 唤起系统安装器安装已下载的 APK。 */
-    fun install(context: Context, apk: File) {
-        val uri: Uri = FileProvider.getUriForFile(
-            context, context.packageName + ".fileprovider", apk
-        )
+    /**
+     * 唤起系统安装器安装已下载的 APK。
+     * @return true 表示成功唤起安装器（不代表用户点了安装）；false 表示无法唤起。
+     *
+     * 注意：这里**不**检查 canRequestPackageInstalls()——小米等 ROM 上该 API 常年
+     * 返回 false（即使「允许安装未知应用」已开），据此拦截会让用户永远装不上。
+     * 直接唤起系统安装器，授权页由安装器自行弹出；失败再由调用方给分厂商引导。
+     */
+    fun install(context: Context, apk: File): Boolean {
+        val uri: Uri = try {
+            FileProvider.getUriForFile(
+                context, context.packageName + ".fileprovider", apk
+            )
+        } catch (e: Exception) {
+            android.widget.Toast.makeText(
+                context, "安装包路径异常：${e.message ?: ""}", android.widget.Toast.LENGTH_LONG
+            ).show()
+            return false
+        }
         val intent = Intent(Intent.ACTION_VIEW).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             setDataAndType(uri, "application/vnd.android.package-archive")
         }
-        try {
+        return try {
             context.startActivity(intent)
+            true
         } catch (e: Exception) {
-            // 部分盒子无系统安装器，提示用户
+            // 部分盒子无系统安装器，或 ROM 直接拦截；调用方据此给引导
             android.widget.Toast.makeText(
                 context, "无法启动安装器，请手动安装：$apk", android.widget.Toast.LENGTH_LONG
             ).show()
+            false
         }
     }
 }
