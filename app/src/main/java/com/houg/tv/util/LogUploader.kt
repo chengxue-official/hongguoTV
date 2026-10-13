@@ -6,24 +6,32 @@ import okhttp3.MediaType
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 /**
- * 日志远程上报：把全量日志 + 设备信息打包，POST 到飞书群机器人 webhook。
+ * 日志远程上报：把全量日志 + 设备信息打包上报到开发者。
  *
- * 用户诉求：电视上分享/传文件太麻烦，希望「后台直接上传到我这」。
+ * 用户诉求演变：电视上分享/传文件太麻烦 → 最初用飞书机器人 webhook 直接灌卡片；
+ * 但 webhook 不支持文件消息，长日志会被切成多张长卡片，接收端要手动滚动复制。
  *
- * 三件套（全量、持久、分片）：
- * 1. **全量**：日志来自 [AppLog.dumpFile]（文件持久化，跨启动、含轮转历史），不做单条截断；
- * 2. **持久**：`AppLog.attach()` 已把每行日志实时落盘，App 重启/崩溃后日志仍在；
- * 3. **分片**：飞书 markdown 卡片正文有长度上限，超长时按行切分成多片连续发送，
- *    标题带 `(i/N)` 序号，接收端按序拼接即得完整日志。
+ * 现行方案（文件化）：
+ * 1. 日志先上传到自有服务器（[LOG_API]，与更新服务器同域，国内可达），
+ *    拿到一次性 token 与「在线查看 / 下载 .txt」链接；
+ * 2. 再发一张**短卡片**到飞书群（标题 + 摘要 + 两个链接），
+ *    接收端在手机上点一下即可拿文件，无需滚动复制；
+ * 3. 上传或发卡片失败 → 降级回旧模式：分片灌卡片（见 [splitChunks]），保证日志不丢。
  *
- * 协议：飞书自定义机器人 incoming webhook（POST JSON，application/json）。
+ * 协议：
+ * - 上传：POST JSON 到 [LOG_API]（自有 Worker，application/json）；
+ * - 降级：飞书自定义机器人 incoming webhook（POST JSON，application/json）。
  */
 object LogUploader {
+
+    /** 与更新服务器同域（UpdateChecker.HOST），国内可达；静态分发与日志 API 同一个 Worker。 */
+    const val LOG_API = "https://hongguo.kdns.fr/api/log"
 
     /** 飞书群机器人 webhook（用户建好机器人后填这里）。空 = 未配置，点击时提示。 */
     const val LOG_WEBHOOK_URL =
@@ -45,6 +53,8 @@ object LogUploader {
     /** 分片之间间隔（ms），规避机器人 5 次/秒的限流。 */
     private const val SEND_INTERVAL_MS = 220L
 
+    private const val TAG = "LogUploader"
+
     private val JSON = MediaType.parse("application/json; charset=utf-8")
 
     /** 上报结果。 */
@@ -52,7 +62,11 @@ object LogUploader {
 
     /**
      * 同步上报全量日志（网络耗时操作，调用方需先切 IO 线程）。
-     * @return [Result.ok]=true 表示全部发出；失败时 [Result.detail] 含已发数量与具体原因。
+     *
+     * 流程：先尝试「文件模式」（上传拿链接 + 发短卡片）；任一环节失败则降级
+     * 为「分片模式」（把日志正文直接灌进多张飞书卡片），确保日志始终能送达。
+     *
+     * @return [Result.ok]=true 表示已送达；失败时 [Result.detail] 含具体原因。
      */
     fun upload(context: Context): Result {
         val url = LOG_WEBHOOK_URL.trim()
@@ -64,11 +78,62 @@ object LogUploader {
         }
 
         val report = buildReport(context)
-        val chunks = splitChunks(report)
-        val total = chunks.size
         val model = android.os.Build.MODEL.replace("\"", "'").replace("\n", " ")
         val time = SimpleDateFormat("MM-dd HH:mm:ss", Locale.US).format(Date())
 
+        // ① 文件模式（首选）：上传拿链接 → 发一张短卡片
+        val uploaded = uploadToServer(report, model, time)
+        if (uploaded != null) {
+            val payload = buildLinkPayload(uploaded, report, model, time)
+            val error = post(url, payload)
+            if (error == null) {
+                return Result(true, "文件模式 · ${report.length} 字符 / ${uploaded.sizeKb}KB")
+            }
+            // 卡片发送失败：链接已生成，仍在降级结果里告知（用户可能想重试）
+            AppLog.e(TAG, "文件模式发卡片失败，降级分片：$error", null)
+        } else {
+            AppLog.e(TAG, "日志上传服务器失败，降级分片模式", null)
+        }
+
+        // ② 分片模式（降级）：正文直接进卡片
+        return uploadChunked(url, report, model, time)
+    }
+
+    /** 上传日志到自有服务器，成功返回链接信息，失败返回 null（静默降级，不打断主流程）。 */
+    private fun uploadToServer(report: String, model: String, time: String): Uploaded? {
+        return try {
+            val sb = StringBuilder(report.length + 256)
+            sb.append('{')
+            sb.append("\"device\":\"").append(escapeJson(model)).append("\",")
+            sb.append("\"time\":\"").append(escapeJson(time)).append("\",")
+            sb.append("\"title\":\"").append(escapeJson("[$KEYWORD] HougTime 上报 · $model · $time")).append("\",")
+            sb.append("\"content\":\"").append(escapeJson(report)).append("\"}")
+            val req = Request.Builder().url(LOG_API)
+                .header("Content-Type", "application/json; charset=utf-8")
+                .post(RequestBody.create(JSON, sb.toString()))
+                .build()
+            val resp: Response = HttpClientProvider.get().newCall(req).execute()
+            try {
+                val text = if (resp.body() != null) resp.body()!!.string() else ""
+                if (!resp.isSuccessful) return null
+                val o = JSONObject(text)
+                if (o.optInt("code", -1) != 0) return null
+                val view = o.optString("view", "")
+                val download = o.optString("download", "")
+                if (view.isEmpty() || download.isEmpty()) return null
+                Uploaded(view, download, o.optLong("size", 0L))
+            } finally {
+                resp.close()
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** 降级路径：把日志按字节切分成多张飞书卡片连续发送。 */
+    private fun uploadChunked(url: String, report: String, model: String, time: String): Result {
+        val chunks = splitChunks(report)
+        val total = chunks.size
         for (i in chunks.indices) {
             val payload = buildPayload(chunks[i], model, time, i + 1, total)
             val error = post(url, payload)
@@ -84,7 +149,12 @@ object LogUploader {
                 }
             }
         }
-        return Result(true, if (total > 1) "共 $total 片，${report.length} 字符" else "${report.length} 字符")
+        return Result(true, if (total > 1) "分片模式 · 共 $total 片，${report.length} 字符" else "${report.length} 字符")
+    }
+
+    /** 已上传日志的对外链接。 */
+    private data class Uploaded(val view: String, val download: String, val size: Long) {
+        val sizeKb: String get() = String.format(Locale.US, "%.1f", size / 1024.0)
     }
 
     /** 发一张卡片；返回 null 表示成功，否则为失败原因。 */
@@ -227,6 +297,46 @@ object LogUploader {
         sb.append("\"elements\":[{\"tag\":\"markdown\",\"content\":\"")
         sb.append(escapeJson(chunk))
         sb.append("\"}]}}")
+        return sb.toString()
+    }
+
+    /**
+     * 组装「文件模式」短卡片：标题 + 摘要 + 日志预览片段 + 两个跳转按钮。
+     * 正文极短（固定几百字符），不受卡片长度限制，也不再需要分片。
+     */
+    private fun buildLinkPayload(up: Uploaded, report: String, model: String, time: String): String {
+        val title = "[$KEYWORD] HougTime 上报 · $model · $time"
+
+        // 摘要：设备信息段（===== 设备信息 ===== 到下一个 ===== 之间），多行压成一行
+        val preview = report
+            .substringBefore("\n\n=====")
+            .substringAfter("===== 设备信息 =====")
+            .trim()
+            .replace('\n', ' ')
+            .take(240)
+
+        val sb = StringBuilder()
+        sb.append('{')
+        sb.append("\"msg_type\":\"interactive\",")
+        sb.append("\"card\":{")
+        sb.append("\"header\":{\"title\":{\"tag\":\"plain_text\",\"content\":\"")
+        sb.append(escapeJson(title))
+        sb.append("\"},\"template\":\"blue\"},")
+        sb.append("\"elements\":[")
+        // 摘要 + 预览
+        sb.append("{\"tag\":\"markdown\",\"content\":\"")
+        sb.append(escapeJson("**日志已文件化，点下方按钮查看/下载**\n\n" +
+                "大小：${up.sizeKb}KB ｜ ${report.length} 字符\n" +
+                "设备：$preview"))
+        sb.append("\"},")
+        // 跳转按钮组（飞书卡片 action 组件：双按钮横排）
+        sb.append("{\"tag\":\"action\",\"actions\":[")
+        sb.append("{\"tag\":\"button\",\"text\":{\"tag\":\"plain_text\",\"content\":\"在线查看\"},")
+        sb.append("\"type\":\"primary\",\"url\":\"").append(escapeJson(up.view)).append("\"},")
+        sb.append("{\"tag\":\"button\",\"text\":{\"tag\":\"plain_text\",\"content\":\"下载 .txt\"},")
+        sb.append("\"type\":\"default\",\"url\":\"").append(escapeJson(up.download)).append("\"}")
+        sb.append("]}")
+        sb.append("]}}")
         return sb.toString()
     }
 
