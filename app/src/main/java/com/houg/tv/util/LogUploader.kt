@@ -41,6 +41,18 @@ object LogUploader {
     private const val KEYWORD = "日志"
 
     /**
+     * 上传限流窗口：同一设备 15 分钟内最多上传一次。
+     *
+     * 双保险：App 端本地节流做即时拦截（省一次网络往返），服务端（Worker）按
+     * deviceKey 独立限流做权威兜底（防改包/清数据绕过）。两边窗口必须一致。
+     */
+    private const val RATE_LIMIT_MS = 15 * 60 * 1000L
+
+    private const val PREFS = "log_uploader"
+    private const val PREF_LAST_UPLOAD = "last_upload_ms"
+    private const val PREF_INSTALL_ID = "install_id"
+
+    /**
      * 单张卡片正文字节上限。飞书实测上限为整卡 100KB，报错原文
      * `card content size is over limit, the max size is 100kb`；
      * 取 48KB 留足转义膨胀（`"`→`\"`）与 card 结构开销的余量。
@@ -57,14 +69,24 @@ object LogUploader {
 
     private val JSON = MediaType.parse("application/json; charset=utf-8")
 
-    /** 上报结果。 */
-    data class Result(val ok: Boolean, val detail: String)
+    /**
+     * 上报结果。
+     * @param ok 是否成功送达
+     * @param detail 成功时为摘要，失败时为原因
+     * @param rateLimited 失败是否由「15 分钟内重复上传」引起（调用方据此换个友好提示，
+     *                    不必显示"上传失败"字样）
+     */
+    data class Result(val ok: Boolean, val detail: String, val rateLimited: Boolean = false)
 
     /**
      * 同步上报全量日志（网络耗时操作，调用方需先切 IO 线程）。
      *
      * 流程：先尝试「文件模式」（上传拿链接 + 发短卡片）；任一环节失败则降级
      * 为「分片模式」（把日志正文直接灌进多张飞书卡片），确保日志始终能送达。
+     *
+     * 限流：15 分钟内只允许上传一次。本地拦截命中直接返回，不发任何请求；
+     * 服务端返回 429 时同样直接返回（**不降级**——否则限流形同虚设，
+     * 仍会往飞书群里灌卡片）。
      *
      * @return [Result.ok]=true 表示已送达；失败时 [Result.detail] 含具体原因。
      */
@@ -77,33 +99,58 @@ object LogUploader {
             return Result(false, "URL 需为飞书机器人地址（https://open.feishu.cn/open-apis/bot/v2/hook/...）")
         }
 
+        // ① 本地节流：15 分钟内已上传过 → 直接拒绝，不消耗网络与飞书配额
+        val localRemain = localRateRemainMs(context)
+        if (localRemain > 0) {
+            return Result(false, "上传过于频繁，请约 ${ceilMinutes(localRemain)} 分钟后再试", rateLimited = true)
+        }
+
         val report = buildReport(context)
         val model = android.os.Build.MODEL.replace("\"", "'").replace("\n", " ")
         val time = SimpleDateFormat("MM-dd HH:mm:ss", Locale.US).format(Date())
 
-        // ① 文件模式（首选）：上传拿链接 → 发一张短卡片
-        val uploaded = uploadToServer(report, model, time)
+        // ② 文件模式（首选）：上传拿链接 → 发一张短卡片
+        val result = uploadToServer(report, model, time, installId(context))
+        val uploaded = result.uploaded
         if (uploaded != null) {
             val payload = buildLinkPayload(uploaded, report, model, time)
             val error = post(url, payload)
             if (error == null) {
+                markUploaded(context)
                 return Result(true, "文件模式 · ${report.length} 字符 / ${uploaded.sizeKb}KB")
             }
             // 卡片发送失败：链接已生成，仍在降级结果里告知（用户可能想重试）
             AppLog.e(TAG, "文件模式发卡片失败，降级分片：$error", null)
+        } else if (result.rateLimited) {
+            // 服务端限流：不降级，避免绕过限流继续灌卡片
+            markUploaded(context)
+            return Result(false, "上传过于频繁，请约 ${ceilMinutes(result.retryAfterSec * 1000L)} 分钟后再试", rateLimited = true)
         } else {
             AppLog.e(TAG, "日志上传服务器失败，降级分片模式", null)
         }
 
-        // ② 分片模式（降级）：正文直接进卡片
-        return uploadChunked(url, report, model, time)
+        // ③ 分片模式（降级）：正文直接进卡片
+        val chunked = uploadChunked(url, report, model, time)
+        if (chunked.ok) markUploaded(context)
+        return chunked
     }
 
-    /** 上传日志到自有服务器，成功返回链接信息，失败返回 null（静默降级，不打断主流程）。 */
-    private fun uploadToServer(report: String, model: String, time: String): Uploaded? {
+    /** 服务端上传结果：三态（成功 / 被限流 / 其它失败）。 */
+    private class ServerResult(
+        val uploaded: Uploaded?,
+        val rateLimited: Boolean = false,
+        val retryAfterSec: Long = 0L
+    )
+
+    /**
+     * 上传日志到自有服务器。
+     * @return 成功时 [ServerResult.uploaded] 非空；被限流时 [ServerResult.rateLimited]=true。
+     */
+    private fun uploadToServer(report: String, model: String, time: String, deviceKey: String): ServerResult {
         return try {
             val sb = StringBuilder(report.length + 256)
             sb.append('{')
+            sb.append("\"deviceKey\":\"").append(escapeJson(deviceKey)).append("\",")
             sb.append("\"device\":\"").append(escapeJson(model)).append("\",")
             sb.append("\"time\":\"").append(escapeJson(time)).append("\",")
             sb.append("\"title\":\"").append(escapeJson("[$KEYWORD] HougTime 上报 · $model · $time")).append("\",")
@@ -115,20 +162,70 @@ object LogUploader {
             val resp: Response = HttpClientProvider.get().newCall(req).execute()
             try {
                 val text = if (resp.body() != null) resp.body()!!.string() else ""
-                if (!resp.isSuccessful) return null
+                if (resp.code() == 429) {
+                    val sec = try { JSONObject(text).optLong("retryAfter", RATE_LIMIT_MS / 1000) } catch (_: Exception) { RATE_LIMIT_MS / 1000 }
+                    return ServerResult(null, rateLimited = true, retryAfterSec = sec)
+                }
+                if (!resp.isSuccessful) return ServerResult(null)
                 val o = JSONObject(text)
-                if (o.optInt("code", -1) != 0) return null
+                if (o.optInt("code", -1) != 0) return ServerResult(null)
                 val view = o.optString("view", "")
                 val download = o.optString("download", "")
-                if (view.isEmpty() || download.isEmpty()) return null
-                Uploaded(view, download, o.optLong("size", 0L))
+                if (view.isEmpty() || download.isEmpty()) return ServerResult(null)
+                ServerResult(Uploaded(view, download, o.optLong("size", 0L)))
             } finally {
                 resp.close()
             }
         } catch (e: Exception) {
-            null
+            ServerResult(null)
         }
     }
+
+    /* ==================== 限流与设备标识 ==================== */
+
+    /** 本地距下次可上传的剩余毫秒；0 表示现在可以上传。 */
+    private fun localRateRemainMs(context: Context): Long {
+        return try {
+            val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val last = prefs.getLong(PREF_LAST_UPLOAD, 0L)
+            if (last <= 0L) return 0L
+            (last + RATE_LIMIT_MS - System.currentTimeMillis()).coerceAtLeast(0L)
+        } catch (_: Exception) {
+            0L
+        }
+    }
+
+    /** 记录本次上传时间（本地节流基准）。 */
+    private fun markUploaded(context: Context) {
+        try {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().putLong(PREF_LAST_UPLOAD, System.currentTimeMillis()).apply()
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * 稳定设备标识（安装级 UUID，持久化）。
+     *
+     * 不能用 SignedRequest.deviceId()——那是**每次启动随机生成**的，做限流键毫无意义。
+     * 首次调用生成并落盘，卸载重装才会变（符合"每台设备 15 分钟一次"的语义）。
+     */
+    private fun installId(context: Context): String {
+        return try {
+            val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val existing = prefs.getString(PREF_INSTALL_ID, null)
+            if (!existing.isNullOrEmpty()) return existing
+            val gen = java.util.UUID.randomUUID().toString().replace("-", "").take(32)
+            prefs.edit().putString(PREF_INSTALL_ID, gen).apply()
+            gen
+        } catch (_: Exception) {
+            // 兜底：拿不到持久化时用机型，至少避免"完全不限流"
+            android.os.Build.MODEL ?: "unknown"
+        }
+    }
+
+    /** 毫秒向上取整为分钟（用于提示文案）。 */
+    private fun ceilMinutes(ms: Long): Long = ((ms + 59_999L) / 60_000L).coerceAtLeast(1L)
 
     /** 降级路径：把日志按字节切分成多张飞书卡片连续发送。 */
     private fun uploadChunked(url: String, report: String, model: String, time: String): Result {

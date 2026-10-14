@@ -57,7 +57,8 @@ class LogActivity : AppCompatActivity() {
     /**
      * 一键上传全量日志到开发者（飞书群机器人）。电视上分享/传文件很麻烦，
      * 这个入口让用户按一下即可把日志送到开发者手机，无需任何操作。
-     * 日志较长时自动分片连发，标题带 (i/N) 序号。
+     *
+     * 限流：同一设备 15 分钟内只允许上传一次（本地即时拦截 + 服务端兜底）。
      */
     private fun uploadLog() {
         val btn = findViewById<TextView>(R.id.btn_upload)
@@ -68,8 +69,11 @@ class LogActivity : AppCompatActivity() {
             val result = withContext(Dispatchers.IO) { LogUploader.upload(this@LogActivity) }
             btn.isEnabled = true
             btn.text = getString(R.string.log_upload)
-            val msg = if (result.ok) "日志已上传（${result.detail}），开发者将收到"
-            else "上传失败：${result.detail}"
+            val msg = when {
+                result.ok -> "日志已上传（${result.detail}），开发者将收到"
+                result.rateLimited -> result.detail   // 限流提示本身就是完整说明，不加"上传失败"前缀
+                else -> "上传失败：${result.detail}"
+            }
             Toast.makeText(this@LogActivity, msg, Toast.LENGTH_LONG).show()
         }
     }
