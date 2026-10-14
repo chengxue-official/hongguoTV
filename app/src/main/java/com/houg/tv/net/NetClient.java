@@ -9,6 +9,7 @@ import com.houg.tv.util.AppLog;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
+import org.json.JSONTokener;
 
 import java.net.URL;
 import java.nio.charset.Charset;
@@ -51,6 +52,22 @@ public final class NetClient {
 
     private static final Pattern ROUTER_DATA = Pattern.compile(
             "(?s)(?:window\\.)?_ROUTER_DATA\\s*=\\s*");
+
+    /* ---- 榜单（网页版 /rank/&lt;board&gt;，与搜索同站，免签名） ---- */
+
+    /** 榜单形态一：mergeLoaderData 脚本，data-fn-args 用双引号包裹（多数榜单）。 */
+    private static final Pattern RANK_FN_ARGS_DQ = Pattern.compile(
+            "(?s)data-fn-args=\"(\\[.*?\\])\"");
+
+    /** 榜单形态二：run-router-data-fn 脚本，data-fn-args 用单引号包裹（部分榜单）。 */
+    private static final Pattern RANK_FN_ARGS_SQ = Pattern.compile(
+            "(?s)data-fn-args='(\\[.*?\\])'");
+
+    /** 榜单每页条数（服务端固定 20，用于校验 rank 区间）。 */
+    private static final int RANK_PAGE_SIZE = 20;
+
+    /** 榜单最大页码（服务端分页上限）。 */
+    private static final int RANK_MAX_PAGE = 500;
 
     private static final String TAG = "NetClient";
 
@@ -219,6 +236,79 @@ public final class NetClient {
         }
     }
 
+    /** 榜单一条：名次 + 剧集 + 热度/评分等展示文案。 */
+    public static final class RankItem {
+        public final int rank;
+        public final Drama drama;
+        /** 热度文案，如「7850万热度」 */
+        public final String heat;
+        /** 评分文案，如「9.0」 */
+        public final String score;
+        /** 收藏文案，如「268.7万收藏」 */
+        public final String favorite;
+        /** 点赞文案，如「470.6万点赞」 */
+        public final String like;
+        /** 状态标签，如「新剧」「热播中」 */
+        public final List<String> statusTags;
+
+        RankItem(int rank, Drama drama, String heat, String score, String favorite, String like,
+                 List<String> statusTags) {
+            this.rank = rank;
+            this.drama = drama;
+            this.heat = heat;
+            this.score = score;
+            this.favorite = favorite;
+            this.like = like;
+            this.statusTags = statusTags;
+        }
+    }
+
+    /** 榜单分页结果。 */
+    public static final class RankingPage {
+        public final String boardId;
+        public final int page;
+        public final int totalPages;
+        public final boolean hasMore;
+        /** 榜单更新时间文案，如「10月14日已更新 · 基于红果内观看/互动等综合热度排序」 */
+        public final String updatedText;
+        public final List<RankItem> items;
+
+        RankingPage(String boardId, int page, int totalPages, boolean hasMore,
+                    String updatedText, List<RankItem> items) {
+            this.boardId = boardId;
+            this.page = page;
+            this.totalPages = totalPages;
+            this.hasMore = hasMore;
+            this.updatedText = updatedText;
+            this.items = items;
+        }
+    }
+
+    /**
+     * 榜单定义。{@code boardId} 是我们自己的稳定标识（也用于 UI 记忆选中项）；
+     * {@code path} 是红果网页 {@code /rank/&lt;path&gt;} 的路径段。
+     */
+    public static final class RankBoard {
+        public final String boardId;
+        public final String path;
+        public final String label;
+
+        public RankBoard(String boardId, String path, String label) {
+            this.boardId = boardId;
+            this.path = path;
+            this.label = label;
+        }
+    }
+
+    /** 可用榜单列表（顺序即 UI 展示顺序）。 */
+    public static final List<RankBoard> RANK_BOARDS = Collections.unmodifiableList(
+            new ArrayList<RankBoard>() {{
+                add(new RankBoard("hot-drama", "hot-drama", "热播榜"));
+                add(new RankBoard("hot-real-drama", "hot-real-drama", "真人剧榜"));
+                add(new RankBoard("hot-comic-drama", "hot-comic-drama", "漫剧榜"));
+                add(new RankBoard("hot-ai-drama", "hot-ai-drama", "AI剧榜"));
+            }});
+
     /* ==================== 分类（App 版） ==================== */
 
     public CatalogPage catalog(String genreKey, String scene, int offset, String sessionId) throws Exception {
@@ -286,6 +376,175 @@ public final class NetClient {
         }
         AppLog.INSTANCE.d(TAG, "catalogAll genre=" + genreKey + " 共 " + all.size() + " 条");
         return all;
+    }
+
+    /* ==================== 榜单（网页版） ==================== */
+
+    /**
+     * 拉取红果官方榜单一页：{@code GET /rank/&lt;board.path&gt;}（page&gt;1 时加
+     * {@code ?page=N}）。页面是 SSR 直出的 HTML，榜单数据内嵌在
+     * {@code data-fn-args} 脚本属性里（两种形态：双引号包裹的 mergeLoaderData、
+     * 单引号包裹的 run-router-data-fn），解析出 {@code rankList} 数组。
+     * 与搜索同站免签名，复用 {@link #getText(String)}。
+     */
+    public RankingPage ranking(RankBoard board, int page) throws Exception {
+        if (board == null || page < 1 || page > RANK_MAX_PAGE) {
+            throw new Exception("榜单页码无效");
+        }
+        String url = WEB_SITE + "/rank/" + board.path + (page > 1 ? "?page=" + page : "");
+        AppLog.INSTANCE.d(TAG, "ranking board=" + board.boardId + " page=" + page);
+        String html = getText(url);
+        if (html == null || html.isEmpty() || html.length() > 4 << 20) {
+            throw new Exception("榜单页面无响应或过大");
+        }
+        JSONObject content = extractRankContent(html);
+        if (content == null || !content.optBoolean("isSuccess", false)) {
+            throw new Exception("榜单数据不可用");
+        }
+        JSONArray rows = content.optJSONArray("rankList");
+        List<RankItem> items = new ArrayList<>();
+        if (rows != null) {
+            int previous = (page - 1) * RANK_PAGE_SIZE;
+            for (int i = 0; i < rows.length(); i++) {
+                JSONObject row = rows.optJSONObject(i);
+                if (row == null) continue;
+                RankItem item = parseRankRow(row, previous);
+                if (item != null) items.add(item);
+            }
+        }
+        if (items.isEmpty()) {
+            throw new Exception("榜单暂无数据");
+        }
+        JSONObject pagination = content.optJSONObject("pagination");
+        int pageNum = pagination == null ? page : pagination.optInt("pageNum", page);
+        int totalPages = pagination == null ? page : pagination.optInt("totalPages", page);
+        boolean hasMore = pageNum < totalPages && !isEmpty(pagination == null ? null : pagination.optString("nextUrl", ""));
+        // updatedText 在 loaderData 的 rank_*/page 页对象里，脚本形态二没有；用页面级解析兜底
+        String updatedText = extractRankUpdatedText(html);
+        AppLog.INSTANCE.d(TAG, "ranking 返回 " + items.size() + " 条 page=" + pageNum + "/" + totalPages);
+        return new RankingPage(board.boardId, pageNum, totalPages, hasMore, updatedText, items);
+    }
+
+    /**
+     * 从 HTML 提取榜单数据对象（{@code isSuccess}/{@code rankList}/{@code pagination}）。
+     * 两种脚本形态统一兼容：先扫单引号属性（形态二 JSON 直接在参数数组里），
+     * 再扫双引号属性（形态二嵌套在 routerDataFnArgs[0] 字符串里）。
+     */
+    private static JSONObject extractRankContent(String html) {
+        // 形态二（单引号）：data-fn-args='[key, "content", {isSuccess, rankList...}]'
+        Matcher sq = RANK_FN_ARGS_SQ.matcher(html);
+        while (sq.find()) {
+            Object arr = parseJsonLenient(unescapeHtml(sq.group(1)));
+            if (!(arr instanceof JSONArray)) continue;
+            JSONArray a = (JSONArray) arr;
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject o = a.optJSONObject(i);
+                if (o != null && o.has("rankList")) return o;
+            }
+        }
+        // 形态一（双引号）：mergeLoaderData 的 routerDataFnArgs[0] 是 JSON 字符串
+        Matcher dq = RANK_FN_ARGS_DQ.matcher(html);
+        while (dq.find()) {
+            Object arr = parseJsonLenient(unescapeHtml(dq.group(1)));
+            if (!(arr instanceof JSONArray)) continue;
+            JSONArray a = (JSONArray) arr;
+            for (int i = 0; i < a.length(); i++) {
+                JSONObject entry = a.optJSONObject(i);
+                if (entry == null) continue;
+                JSONArray fnArgs = entry.optJSONArray("routerDataFnArgs");
+                if (fnArgs == null || fnArgs.length() == 0) continue;
+                Object v = parseJsonLenient(fnArgs.optString(0));
+                if (v instanceof JSONObject && ((JSONObject) v).has("rankList")) {
+                    return (JSONObject) v;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** 解析单条榜单行。rank 必须落在当前页区间且不重复出现倒退（防御脏数据）。 */
+    private static RankItem parseRankRow(JSONObject row, int previousMax) {
+        String id = firstNonEmpty(optText(row, "seriesId"), optText(row, "id"));
+        if (id == null || id.isEmpty() || !id.matches("\\d{10,30}")) return null;
+        String title = optText(row, "title");
+        if (title == null || title.isEmpty()) return null;
+        int rank = row.optInt("rank", 0);
+        if (rank <= previousMax || rank > previousMax + RANK_PAGE_SIZE) return null;
+
+        String cover = optText(row, "cover");
+        String intro = optText(row, "description");
+        String heat = optText(row, "heatText");
+        String score = optText(row, "scoreText");
+        if (score != null) score = score.replaceFirst("^评分", "");
+        String favorite = optText(row, "favoriteText");
+        String like = optText(row, "likeText");
+        // 展示行：热度 + 状态标签（第1名另有金色徽标由 UI 处理）
+        StringBuilder remark = new StringBuilder();
+        if (heat != null && !heat.isEmpty()) remark.append(heat);
+        List<String> statusTags = new ArrayList<>();
+        JSONArray st = row.optJSONArray("statusTags");
+        if (st != null) {
+            for (int i = 0; i < st.length(); i++) {
+                String t = st.optString(i);
+                if (t != null && !t.isEmpty()) statusTags.add(t);
+            }
+        }
+        List<String> tags = new ArrayList<>();
+        JSONArray tg = row.optJSONArray("tags");
+        if (tg != null) {
+            for (int i = 0; i < tg.length(); i++) {
+                addTag(tags, tg.optString(i));
+            }
+        }
+        if (statusTags.size() > 0) {
+            addTag(tags, statusTags.get(0));
+        }
+        Drama drama = new Drama(id, title, cover, intro, "", remark.toString(), tags);
+        return new RankItem(rank, drama, heat, score, favorite, like, statusTags);
+    }
+
+    /** 从页面 JSON 里抠出 updatedText（形态二没有此字段，找不到就空串）。 */
+    private static String extractRankUpdatedText(String html) {
+        int i = html.indexOf("\"updatedText\"");
+        if (i < 0) i = html.indexOf("updatedText");
+        if (i < 0) return "";
+        int colon = html.indexOf(':', i);
+        if (colon < 0) return "";
+        int q1 = html.indexOf('"', colon + 1);
+        if (q1 < 0) return "";
+        int q2 = html.indexOf('"', q1 + 1);
+        if (q2 < 0) return "";
+        String raw = html.substring(q1 + 1, q2);
+        // 该字段在 _ROUTER_DATA 的 JSON 字符串里，中文是原样、斜杠可能被转义
+        return unescapeHtml(raw).replace("\\u002F", "/");
+    }
+
+    /** HTML 实体反转义（仅处理 &quot; &amp; &lt; &gt; &#39; 与数字实体）。 */
+    private static String unescapeHtml(String s) {
+        if (s == null || s.indexOf('&') < 0) return s;
+        return s.replace("&quot;", "\"")
+                .replace("&#39;", "'")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&amp;", "&");
+    }
+
+    /** 宽容 JSON 解析：用 JSONTokener 只取前缀合法值，失败返回 null。 */
+    private static Object parseJsonLenient(String s) {
+        if (s == null) return null;
+        s = s.trim();
+        if (s.isEmpty()) return null;
+        try {
+            JSONTokener t = new JSONTokener(s);
+            Object v = t.nextValue();
+            return v;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static boolean isEmpty(String s) {
+        return s == null || s.isEmpty();
     }
 
     /* ==================== 详情（App 版） ==================== */

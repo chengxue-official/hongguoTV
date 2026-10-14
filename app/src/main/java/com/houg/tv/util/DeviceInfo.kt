@@ -22,6 +22,7 @@ object DeviceInfo {
         val abis = Build.SUPPORTED_ABIS.joinToString(", ")
 
         val sb = StringBuilder()
+        sb.append("App 版本: ").append(appVersion(context)).append('\n')
         sb.append("设备型号: ").append(Build.MODEL).append('\n')
         sb.append("品牌厂商: ").append(Build.BRAND).append('/').append(Build.MANUFACTURER).append('\n')
         sb.append("系统版本: Android ").append(Build.VERSION.RELEASE)
@@ -32,6 +33,22 @@ object DeviceInfo {
         sb.append("CPU ABI: ").append(abis).append('\n')
         sb.append("总内存: ").append(totalMemoryMb()).append(" MB")
         return sb.toString()
+    }
+
+    /**
+     * App 版本（versionName(versionCode)）。日志必须带版本号，
+     * 否则无法判断用户报的问题是不是新版本已修的（历史教训：把最新版当成 1.0.4 排查）。
+     */
+    fun appVersion(context: Context): String {
+        return try {
+            val pi = context.packageManager.getPackageInfo(context.packageName, 0)
+            val name = pi.versionName ?: "?"
+            @Suppress("DEPRECATION")
+            val code = pi.versionCode // API 21+ 可用；longVersionCode 需 API 28
+            "$name($code)"
+        } catch (e: Throwable) {
+            "?"
+        }
     }
 
     /** 总内存（MB），读 /proc/meminfo，失败返回 -1。 */

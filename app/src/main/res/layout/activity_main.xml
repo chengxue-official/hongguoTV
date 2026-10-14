@@ -124,6 +124,21 @@
             android:clickable="true" />
 
         <TextView
+            android:id="@+id/btn_rank"
+            android:layout_width="wrap_content"
+            android:layout_height="40dp"
+            android:layout_marginStart="12dp"
+            android:gravity="center"
+            android:paddingStart="20dp"
+            android:paddingEnd="20dp"
+            android:text="@string/nav_rank"
+            android:textColor="@color/text_primary"
+            android:textSize="15sp"
+            android:background="@drawable/button_bg"
+            android:focusable="true"
+            android:clickable="true" />
+
+        <TextView
             android:id="@+id/btn_log"
             android:layout_width="wrap_content"
             android:layout_height="40dp"

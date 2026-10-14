@@ -135,7 +135,9 @@ public final class HongguoCommentSign {
         byte[] out = new byte[prefix.length + data.length];
         System.arraycopy(prefix, 0, out, 0, prefix.length);
         System.arraycopy(data, 0, out, prefix.length, data.length);
-        return java.util.Base64.getEncoder().encodeToString(out);
+        // java.util.Base64 是 API 26+ 才有，Android 7 以下会 NoClassDefFoundError 闪退
+        // （日志实锤：MagicBox_M16S API 22 拉弹幕即崩）。统一用 android.util.Base64。
+        return android.util.Base64.encodeToString(out, android.util.Base64.NO_WRAP);
     }
 
     /* ---------------- X-Argus ---------------- */
@@ -219,7 +221,8 @@ public final class HongguoCommentSign {
             out[0] = 0x3c;
             out[1] = (byte) 0xcc;
             System.arraycopy(encrypted, 0, out, 2, encrypted.length);
-            return java.util.Base64.getEncoder().encodeToString(out);
+            // 同上：android.util.Base64 兼容 API 19+（NO_WRAP 无换行，等价 java.util 标准编码）
+            return android.util.Base64.encodeToString(out, android.util.Base64.NO_WRAP);
         } catch (Exception e) {
             throw new IllegalStateException("X-Argus 加密失败", e);
         }

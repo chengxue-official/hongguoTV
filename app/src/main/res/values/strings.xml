@@ -4,8 +4,17 @@
     <string name="nav_search">搜索</string>
     <string name="nav_history">历史</string>
     <string name="nav_favorite">收藏</string>
+    <string name="nav_rank">榜单</string>
     <string name="nav_log">日志</string>
     <string name="nav_update">检查更新</string>
+
+    <!-- 榜单 -->
+    <string name="rank_title">榜单</string>
+    <string name="rank_empty">榜单暂无数据</string>
+    <string name="rank_load_failed">榜单加载失败，请重试</string>
+    <string name="rank_no">NO.%1$s</string>
+    <string name="rank_page_info">第 %1$s / %2$s 页</string>
+    <string name="rank_updated">%1$s</string>
     <string name="log_title">调试日志</string>
     <string name="log_clear">清空</string>
     <string name="log_upload">上传日志</string>
@@ -59,4 +68,16 @@
     <string name="menu_speed">倍速</string>
     <string name="menu_exit">退出播放</string>
     <string name="press_again_to_exit">再按一次返回键退出播放</string>
+
+    <!-- 选集弹窗 -->
+    <string name="menu_episodes">选集</string>
+    <string name="ep_picker_title">选集</string>
+    <string name="ep_picker_subtitle">正在看第 %1$s 集</string>
+    <string name="ep_picker_close">关闭</string>
+    <string name="ep_picker_jump">跳转集数</string>
+    <string name="ep_picker_prev_group">‹ 上一组</string>
+    <string name="ep_picker_next_group">下一组 ›</string>
+    <string name="ep_picker_range">第 %1$s—%2$s 集 / 共 %3$s 集</string>
+    <string name="ep_picker_jump_hint">输入集数后按确定跳转</string>
+    <string name="ep_picker_jump_invalid">没有这一集</string>
 </resources>

@@ -189,6 +189,22 @@
             android:clickable="true" />
 
         <TextView
+            android:id="@+id/menu_episodes"
+            android:layout_width="220dp"
+            android:layout_height="44dp"
+            android:layout_marginTop="8dp"
+            android:gravity="center_vertical"
+            android:paddingStart="14dp"
+            android:paddingEnd="14dp"
+            android:text="@string/menu_episodes"
+            android:textColor="@color/text_primary"
+            android:textSize="15sp"
+            android:background="@drawable/button_bg"
+            android:focusable="true"
+            android:focusableInTouchMode="true"
+            android:clickable="true" />
+
+        <TextView
             android:id="@+id/menu_exit"
             android:layout_width="220dp"
             android:layout_height="44dp"
@@ -216,6 +232,9 @@
         android:focusable="true"
         android:focusableInTouchMode="true"
         android:background="@android:color/transparent" />
+
+    <!-- 选集弹窗（最上层，默认 gone，菜单"选集"点亮） -->
+    <include layout="@layout/ep_picker" />
 
     <!-- 居中提示条（toast_hint）见上；本布局不再保留旧版底部控制栏按钮。 -->
 </FrameLayout>

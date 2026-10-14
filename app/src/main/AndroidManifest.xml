@@ -52,6 +52,11 @@
             android:configChanges="keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode" />
 
         <activity
+            android:name="com.houg.tv.RankActivity"
+            android:screenOrientation="landscape"
+            android:configChanges="keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode" />
+
+        <activity
             android:name="com.houg.tv.PlayerActivity"
             android:screenOrientation="landscape"
             android:theme="@style/AppTheme.Fullscreen"

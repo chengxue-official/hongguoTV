@@ -4,10 +4,14 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.InputType
 import android.view.KeyEvent
 import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.GridLayout
 import android.widget.SeekBar
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
@@ -102,6 +106,11 @@ class PlayerActivity : AppCompatActivity() {
     /** 本集起播是否已失败（解码/网络）。失败时上下键仍可切走，但不再自动跳集。 */
     private var currentEpisodeFailed = false
     /**
+     * 因「本地缓存文件损坏」已自动删档重下过的 vid。
+     * 每个 vid 只自愈一次，避免文件反复下坏时陷入「下载→失败→再下载」死循环。
+     */
+    private var ioRetriedVid: String? = null
+    /**
      * 切集抑制的安全兜底：STATE_READY / onPlayerError 理论上都会解除抑制，
      * 但为了防任何未知的卡死路径（如某些 ROM 回调丢失），切集时同时挂一个
      * 延迟任务，到点强制解除——上下键永不能被锁死。
@@ -130,18 +139,41 @@ class PlayerActivity : AppCompatActivity() {
     private lateinit var menuFill: TextView
     private lateinit var menuDanmaku: TextView
     private lateinit var menuSpeed: TextView
+    private lateinit var menuEpisodes: TextView
     private lateinit var menuExit: TextView
     private lateinit var progress: View
     private lateinit var errorText: TextView
     private lateinit var danmakuView: DanmakuView
 
+    // ===== 选集弹窗 =====
+    private lateinit var epPickerRoot: View
+    private lateinit var epPickerTitle: TextView
+    private lateinit var epPickerRange: TextView
+    private lateinit var epGrid: GridLayout
+    private lateinit var epBtnClose: TextView
+    private lateinit var epBtnJump: TextView
+    private lateinit var epBtnPrev: TextView
+    private lateinit var epBtnNext: TextView
+    /** 弹窗当前页（组）起始集号（0-based，页内第一集） */
+    private var epGroupStart = 0
+    /** 弹窗内的格子视图缓存（每页 20 个），复用避免反复 new */
+    private val epCells = ArrayList<TextView>()
+
     private var speedIndex = 2
     private var danmakuEnabled = true
     private val danmakuFetchedWindows = mutableSetOf<Long>()
     private var lastDanmakuWindow = -1L
-    /** 预加载：已发起预取的下一集位置与任务句柄 */
-    private var prefetchedPos = -1
+    /**
+     * 预加载：串行预取协程句柄 + 运行标记。
+     * 从「只预取下一集」升级为「预取当前集之后 PREFETCH_AHEAD 集」，
+     * 实现任意方向切集（含选集弹窗跳转）都丝滑命中缓存。
+     * "是否已预取" 以本地缓存文件实际存在为准（自校正，不依赖内存集合，
+     * 避免清理缓存后内存标记变脏导致漏取）。
+     */
     private var prefetchJob: Job? = null
+    @Volatile private var prefetchRunning = false
+    /** 本轮预取失败的 vid：不再反复重试，避免请求风暴被风控（切集后新窗口自然重来）。 */
+    private val failedPrefetch = mutableSetOf<String>()
 
     private val playerListener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
@@ -182,7 +214,63 @@ class PlayerActivity : AppCompatActivity() {
             // 用户按上下键切集将被永久拦截（只有退出播放页才能恢复）。
             currentEpisodeFailed = true
             releaseSwitchGuard()
-            showError("当前设备可能不支持 H.265 解码（" + error.errorCodeName + "）")
+
+            // ===== 错误分类：I/O 类不是解码问题，别误导用户换设备 =====
+            // 线上反馈：VIDAA_TV 报「当前设备可能不支持 H.265 解码
+            // (ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE)」，但该码属于
+            // androidx.media3 的 **IO 分支**（读本地文件越界），与解码器无关。
+            // 真因是明文缓存文件损坏/被截断（下载中途进程被杀、磁盘写满等），
+            // 而 findCachedClearFile 只看"存在且 >1KB"就会命中坏文件 →
+            // 每次进这一集都失败，看起来像"设备不支持"，其实删掉重下即可。
+            if (isLocalFileCorruption(error)) {
+                val badVid = vidList.getOrNull(currentPos)
+                if (badVid != null && badVid != ioRetriedVid) {
+                    ioRetriedVid = badVid
+                    AppLog.d("PlayerActivity", "疑似本地缓存损坏(" + error.errorCodeName
+                            + ")，删除重下 vid=$badVid")
+                    try {
+                        File(cacheDir, "clear_$badVid.mp4").delete()
+                    } catch (e: Throwable) {
+                        AppLog.d("PlayerActivity", "删除坏缓存失败: " + (e.message ?: ""))
+                    }
+                    // 删完直接重新起播本集（playCurrent 会走完整取流+下载+解密路径）。
+                    // 每个 vid 只自动重试一次，避免反复失败时陷入下载循环。
+                    currentEpisodeFailed = false
+                    playCurrent()
+                    return
+                }
+                showError("视频文件异常，请检查设备存储空间后重试（" + error.errorCodeName + "）")
+                return
+            }
+            showError(describePlaybackError(error))
+        }
+    }
+
+    /**
+     * 是否属于「本地明文文件损坏/读取越界」类错误（可通过删缓存重下自愈）。
+     * 只认 IO / 容器解析分支；解码器分支交给 describePlaybackError 报 H.265。
+     */
+    private fun isLocalFileCorruption(error: PlaybackException): Boolean {
+        return when (error.errorCode) {
+            PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE,
+            PlaybackException.ERROR_CODE_IO_UNSPECIFIED,
+            PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED,
+            PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED -> true
+            else -> false
+        }
+    }
+
+    /** 播放错误 → 用户可读文案（不再把所有错误都甩锅给 H.265）。 */
+    private fun describePlaybackError(error: PlaybackException): String {
+        return when (error.errorCode) {
+            PlaybackException.ERROR_CODE_DECODING_FAILED,
+            PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
+            PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED ->
+                "当前设备可能不支持 H.265 解码（" + error.errorCodeName + "）"
+            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
+            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT ->
+                "网络连接中断，请检查网络后重试（" + error.errorCodeName + "）"
+            else -> "播放失败（" + error.errorCodeName + "）"
         }
     }
 
@@ -224,10 +312,20 @@ class PlayerActivity : AppCompatActivity() {
         menuFill = findViewById(R.id.menu_fill)
         menuDanmaku = findViewById(R.id.menu_danmaku)
         menuSpeed = findViewById(R.id.menu_speed)
+        menuEpisodes = findViewById(R.id.menu_episodes)
         menuExit = findViewById(R.id.menu_exit)
         progress = findViewById(R.id.progress)
         errorText = findViewById(R.id.error_text)
         danmakuView = findViewById(R.id.danmaku_view)
+
+        epPickerRoot = findViewById(R.id.ep_picker_root)
+        epPickerTitle = findViewById(R.id.ep_picker_title)
+        epPickerRange = findViewById(R.id.ep_picker_range)
+        epGrid = findViewById(R.id.ep_grid)
+        epBtnClose = findViewById(R.id.ep_btn_close)
+        epBtnJump = findViewById(R.id.ep_btn_jump)
+        epBtnPrev = findViewById(R.id.ep_btn_prev)
+        epBtnNext = findViewById(R.id.ep_btn_next)
 
         // 读取持久化的画幅模式（默认「适应」= 保持比例）、倍速、弹幕开关
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
@@ -271,7 +369,13 @@ class PlayerActivity : AppCompatActivity() {
         menuFill.setOnClickListener { cycleAspect() }
         menuDanmaku.setOnClickListener { toggleDanmaku() }
         menuSpeed.setOnClickListener { cycleSpeed() }
+        menuEpisodes.setOnClickListener { openEpisodePicker() }
         menuExit.setOnClickListener { showExitDialog() }
+
+        epBtnClose.setOnClickListener { closeEpisodePicker() }
+        epBtnJump.setOnClickListener { showJumpDialog() }
+        epBtnPrev.setOnClickListener { switchEpGroup(-1) }
+        epBtnNext.setOnClickListener { switchEpGroup(1) }
 
         surfaceView.setOnClickListener { togglePlayPause() }
 
@@ -326,7 +430,6 @@ class PlayerActivity : AppCompatActivity() {
         danmakuView.reset()
         tkhdWidth = 0; tkhdHeight = 0; tkhdRotation = 0
         videoWidth = 0; videoHeight = 0
-        prefetchedPos = -1
         resumedThisEpisode = false
         pendingResumeMs = 0L
 
@@ -614,59 +717,86 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     /**
-     * 预加载下一集：提前请求 videoModel 并下载解密到本地缓存文件。
-     * 切集时若缓存命中则跳过网络直接起播。
-     * 失败后只在切集/换集时才会重新触发，不做 500ms 级重试（避免请求风暴被风控）。
+     * 预加载当前集之后的若干集：提前请求 videoModel 并下载解密到本地缓存文件。
+     * 切集（含选集弹窗跳转）时若缓存命中则跳过网络直接起播，实现丝滑切集。
+     *
+     * 设计要点：
+     *  - **串行**下载（一次一集）：并发会抢带宽拖慢当前集，且 remux 瞬时内存
+     *    占用叠加，低内存盒子（823MB）容易 OOM。
+     *  - **以文件存在为准**判断是否需要预取，自校正、无内存状态漂移。
+     *  - 由 500ms 进度回调反复调用，切集后新窗口会自动补上；prefetchRunning
+     *    保证同一时刻只有一个预取循环在跑。
+     *  - 失败后不立即重试该集（记入 failedPos），避免请求风暴被风控。
      */
     private fun prefetchNext() {
-        val nextPos = currentPos + 1
-        if (nextPos >= vidList.size) return
-        if (prefetchedPos == nextPos) return
-        if (prefetchJob?.isActive == true) return
-        prefetchedPos = nextPos
-        val vid = vidList[nextPos]
+        if (prefetchRunning) return
+        // 找出预取窗口内尚未缓存的集（currentPos+1 .. currentPos+PREFETCH_AHEAD）
+        val pending = ArrayList<Int>()
+        val end = minOf(currentPos + PREFETCH_AHEAD, vidList.size - 1)
+        for (p in (currentPos + 1)..end) {
+            val vid = vidList.getOrNull(p) ?: continue
+            if (vid in failedPrefetch) continue
+            if (findCachedClearFile(vid) != null) continue
+            pending.add(p)
+        }
+        if (pending.isEmpty()) return
+
+        prefetchRunning = true
         val gen = playGen
         prefetchJob = scope.launch {
             try {
-                AppLog.d("PlayerActivity", "预加载下一集 pos=$nextPos vid=$vid")
-                val video = withContext(Dispatchers.IO) { App.netClient.videoModel(vid) }
-                val file = withContext(Dispatchers.IO) {
-                    val downloader = CencMp4Downloader(HttpClientProvider.get(this@PlayerActivity))
-                    var out: File? = null
-                    if (video.variants.isNotEmpty()) {
-                        for (v in video.variants) {
-                            if (!v.encrypted) continue
-                            try {
-                                val clear = CencMp4Remuxer.remux(
-                                        downloader.downloadWithRetry(v.urls), v.cencKey)
-                                val f = File(cacheDir, "clear_" + video.videoId + ".mp4")
-                                f.writeBytes(clear)
-                                out = f
-                                break
-                            } catch (e: Exception) {
-                                AppLog.e("PlayerActivity", "预加载变体失败", e)
+                for (pos in pending) {
+                    if (gen != playGen) return@launch   // 已切集，本窗口作废
+                    val vid = vidList.getOrNull(pos) ?: continue
+                    if (findCachedClearFile(vid) != null) continue
+                    try {
+                        AppLog.d("PlayerActivity", "预加载 pos=$pos vid=$vid")
+                        val video = withContext(Dispatchers.IO) { App.netClient.videoModel(vid) }
+                        withContext(Dispatchers.IO) {
+                            val downloader = CencMp4Downloader(
+                                    HttpClientProvider.get(this@PlayerActivity))
+                            var ok = false
+                            if (video.variants.isNotEmpty()) {
+                                for (v in video.variants) {
+                                    if (!v.encrypted) continue
+                                    try {
+                                        val clear = CencMp4Remuxer.remux(
+                                                downloader.downloadWithRetry(v.urls), v.cencKey)
+                                        File(cacheDir, "clear_" + video.videoId + ".mp4")
+                                                .writeBytes(clear)
+                                        ok = true
+                                        break
+                                    } catch (e: Exception) {
+                                        AppLog.e("PlayerActivity", "预加载变体失败", e)
+                                    }
+                                }
                             }
+                            if (!ok && video.urls.isNotEmpty()) {
+                                try {
+                                    val clear = CencMp4Remuxer.remux(
+                                            downloader.downloadWithRetry(video.urls), video.cencKey)
+                                    File(cacheDir, "clear_" + video.videoId + ".mp4")
+                                            .writeBytes(clear)
+                                    ok = true
+                                } catch (e: Exception) {
+                                    AppLog.e("PlayerActivity", "预加载兜底失败", e)
+                                }
+                            }
+                            if (!ok) failedPrefetch.add(vid)
                         }
-                    }
-                    if (out == null && video.urls.isNotEmpty()) {
-                        try {
-                            val clear = CencMp4Remuxer.remux(
-                                    downloader.downloadWithRetry(video.urls), video.cencKey)
-                            val f = File(cacheDir, "clear_" + video.videoId + ".mp4")
-                            f.writeBytes(clear)
-                            out = f
-                        } catch (e: Exception) {
-                            AppLog.e("PlayerActivity", "预加载兜底失败", e)
+                        if (gen != playGen) return@launch
+                        AppLog.d("PlayerActivity", "预加载完成 pos=$pos vid=$vid")
+                    } catch (e: Throwable) {
+                        // 失败不打扰用户：切集时走正常路径（playCurrent 会重新取流）。
+                        // 记下 vid 本轮不再重试，避免每 500ms 一次形成请求风暴。
+                        if (e.message?.contains("cancel", ignoreCase = true) != true) {
+                            failedPrefetch.add(vid)
                         }
+                        AppLog.d("PlayerActivity", "预加载失败 pos=$pos: " + (e.message ?: ""))
                     }
-                    out
                 }
-                if (gen != playGen) return@launch
-                AppLog.d("PlayerActivity", "预加载完成 pos=$nextPos file=${file?.name}")
-            } catch (e: Throwable) {
-                // 失败不打扰用户：切集时走正常路径（playCurrent 会重新取流）。
-                // 注意不要把 prefetchedPos 复位，否则每 500ms 会重试一次形成请求风暴。
-                AppLog.d("PlayerActivity", "预加载失败 pos=$nextPos: " + (e.message ?: ""))
+            } finally {
+                prefetchRunning = false
             }
         }
     }
@@ -684,8 +814,13 @@ class PlayerActivity : AppCompatActivity() {
                 danmakuFetchedWindows.add(window)
                 danmakuView.addItems(items)  // 累积合并，不覆盖其他窗口数据
                 AppLog.d("PlayerActivity", "弹幕 window=$window 返回 ${items.size} 条")
-            } catch (e: Exception) {
-                AppLog.d("PlayerActivity", "弹幕拉取失败 window=$window: " + (e.message ?: ""))
+            } catch (e: Throwable) {
+                // ⚠️ 必须是 Throwable 而不是 Exception：NoClassDefFoundError /
+                // NoSuchMethodError 这类 LinkageError 继承自 Error，用 Exception 接不住，
+                // 会直接冒到 CoroutineExceptionHandler 让 App 闪退
+                // （日志实锤：API 22 设备 java.util.Base64 缺失 → 拉弹幕即闪退）。
+                // 弹幕是附属功能，任何失败都不该影响观看。
+                AppLog.d("PlayerActivity", "弹幕拉取失败 window=$window: " + (e.message ?: e.javaClass.simpleName))
             }
         }
     }
@@ -738,10 +873,14 @@ class PlayerActivity : AppCompatActivity() {
         recordHistory(force = true)
         currentPos = pos
         resumePosition = 0
-        // 停止上一集；只清理「非当前集、非下一集」的明文临时文件。
-        // 关键：不能整目录删——新集若已预加载，删掉会让缓存永远命中不了（预加载失效）。
+        // 停止上一集；只清理「新预取窗口之外」的明文临时文件。
+        // 关键：不能整目录删——新窗口（当前集起 PREFETCH_AHEAD 集）里若已有
+        // 预加载文件，删掉会让缓存永远命中不了（预加载失效、切集又变卡）。
         releasePlayer()
-        cleanupClearFiles(keep = setOf(vidList.getOrNull(pos), vidList.getOrNull(pos + 1)))
+        val keep = HashSet<String>()
+        val keepEnd = minOf(pos + PREFETCH_AHEAD, vidList.size - 1)
+        for (k in pos..keepEnd) vidList.getOrNull(k)?.let { keep.add(it) }
+        cleanupClearFiles(keep = keep)
         playCurrent()
         showControls()
         // 注意：switchingEpisode 不在这里复位——要等新集真正 startPlayback
@@ -927,6 +1066,10 @@ class PlayerActivity : AppCompatActivity() {
         else String.format(Locale.US, "%02d:%02d", m, s)
     }
 
+    /** dp → px（选集弹窗动态建格子用）。 */
+    private fun dp(v: Int): Int =
+        (v * resources.displayMetrics.density + 0.5f).toInt()
+
     /* ==================== 菜单 ==================== */
 
     private fun toggleMenu() {
@@ -981,6 +1124,14 @@ class PlayerActivity : AppCompatActivity() {
     /* ==================== 按键 ==================== */
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        // 选集弹窗展开时：返回/菜单关闭，其余方向键+确定交给系统做焦点导航
+        if (epPickerRoot.visibility == View.VISIBLE) {
+            when (keyCode) {
+                KeyEvent.KEYCODE_MENU -> { closeEpisodePicker(); return true }
+                KeyEvent.KEYCODE_BACK -> { closeEpisodePicker(); return true }
+                else -> return super.onKeyDown(keyCode, event)
+            }
+        }
         // 菜单展开时：只接管菜单键/返回键，方向键留给系统做焦点导航
         if (menuPanel.visibility == View.VISIBLE) {
             when (keyCode) {
@@ -1100,6 +1251,147 @@ class PlayerActivity : AppCompatActivity() {
      * 对话框按钮无初始焦点时返回键被吞，用户被困在播放页；保持 cancelable(true) 并在
      * onShow 显式聚焦「继续播放」。
      */
+    /* ==================== 选集弹窗 ==================== */
+
+    /** 每页集数：5 列 × 4 行 = 20（与参考图一致）。 */
+    private val EP_PAGE_SIZE = 20
+    private val EP_COLUMNS = 5
+
+    /** 打开选集弹窗：定位到当前集所在页，暂停播放并抢焦点。 */
+    private fun openEpisodePicker() {
+        if (vidList.isEmpty()) return
+        hideMenu()
+        // 弹窗是独立焦点域：打开时暂停，避免用户在选集时声音继续
+        tracking = false
+        val p = player
+        p?.pause()
+        // 当前集所在页起始下标
+        epGroupStart = (currentPos / EP_PAGE_SIZE) * EP_PAGE_SIZE
+        buildEpisodeGrid()
+        epPickerRoot.visibility = View.VISIBLE
+        // 焦点落到当前集格子（若在本页），否则落到网格第一个
+        epGrid.post {
+            val cur = epCells.getOrNull(currentPos - epGroupStart)
+            (cur ?: epCells.firstOrNull())?.requestFocus()
+        }
+    }
+
+    private fun closeEpisodePicker() {
+        epPickerRoot.visibility = View.GONE
+        findViewById<View>(R.id.focus_anchor).post {
+            try { findViewById<View>(R.id.focus_anchor).requestFocus() } catch (_: Exception) {}
+        }
+        showControls()
+    }
+
+    /** 生成/刷新网格：复用 epCells，填充当前页的集数按钮。 */
+    private fun buildEpisodeGrid() {
+        val total = vidList.size
+        epPickerTitle.text = getString(R.string.ep_picker_title) + " / " +
+                getString(R.string.ep_picker_subtitle, currentEpisode())
+        val pageEnd = minOf(epGroupStart + EP_PAGE_SIZE, total)
+        epPickerRange.text = getString(
+                R.string.ep_picker_range,
+                epGroupStart + 1, pageEnd, total)
+
+        // 确保格子数量够一页
+        while (epCells.size < EP_PAGE_SIZE) {
+            val tv = TextView(this)
+            tv.setTextColor(resources.getColor(R.color.text_primary))
+            tv.textSize = 15f
+            tv.gravity = android.view.Gravity.CENTER
+            tv.background = resources.getDrawable(R.drawable.ep_cell_bg)
+            tv.isFocusable = true
+            tv.isFocusableInTouchMode = true
+            tv.isClickable = true
+            val lp = GridLayout.LayoutParams()
+            lp.width = dp(90)
+            lp.height = dp(48)
+            lp.setMargins(dp(4), dp(4), dp(4), dp(4))
+            // 靠 GridLayout columnCount=5 自动流式换行，格子固定宽，避免 weight 布局踩坑
+            tv.layoutParams = lp
+            epGrid.addView(tv)
+            epCells.add(tv)
+        }
+        epGrid.removeAllViews()
+
+        for (i in 0 until EP_PAGE_SIZE) {
+            val tv = epCells[i]
+            val idx = epGroupStart + i
+            if (idx < total) {
+                tv.text = (epList.getOrNull(idx) ?: (idx + 1)).toString()
+                tv.visibility = View.VISIBLE
+                // 当前集高亮（selected 态）
+                tv.isSelected = (idx == currentPos)
+                tv.setOnClickListener {
+                    closeEpisodePicker()
+                    switchEpisode(idx)
+                }
+            } else {
+                tv.visibility = View.INVISIBLE
+                tv.setOnClickListener(null)
+            }
+            epGrid.addView(tv)
+        }
+        // 上一组/下一组可用性
+        epBtnPrev.isEnabled = epGroupStart > 0
+        epBtnPrev.alpha = if (epGroupStart > 0) 1f else 0.4f
+        epBtnNext.isEnabled = pageEnd < total
+        epBtnNext.alpha = if (pageEnd < total) 1f else 0.4f
+    }
+
+    /** 切换上/下一页（组）。 */
+    private fun switchEpGroup(dir: Int) {
+        val total = vidList.size
+        var start = epGroupStart + dir * EP_PAGE_SIZE
+        if (start < 0) start = 0
+        if (start >= total) start = (total - 1) / EP_PAGE_SIZE * EP_PAGE_SIZE
+        if (start == epGroupStart) return
+        epGroupStart = start
+        buildEpisodeGrid()
+        epCells.firstOrNull { it.visibility == View.VISIBLE }?.requestFocus()
+    }
+
+    /** 跳转集数：输入框弹窗，输入目标集号后按下标切集。 */
+    private fun showJumpDialog() {
+        val input = EditText(this)
+        input.inputType = InputType.TYPE_CLASS_NUMBER
+        input.hint = getString(R.string.ep_picker_jump_hint)
+        val pad = dp(24)
+        val container = FrameLayout(this)
+        val lp = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT)
+        lp.setMargins(pad, dp(8), pad, 0)
+        input.layoutParams = lp
+        container.addView(input)
+        val dialog = AlertDialog.Builder(this)
+                .setTitle(R.string.ep_picker_jump)
+                .setView(container)
+                .setPositiveButton("跳转") { _, _ ->
+                    val n = input.text.toString().toIntOrNull()
+                    if (n != null) jumpToEpisode(n)
+                }
+                .setNegativeButton("取消", null)
+                .create()
+        dialog.setOnShowListener {
+            try { input.requestFocus() } catch (_: Exception) {}
+        }
+        dialog.show()
+    }
+
+    /** 按集号（epList 里的显示值）跳转；找不到则提示。 */
+    private fun jumpToEpisode(epNumber: Int) {
+        val idx = epList.indexOf(epNumber).let {
+            if (it >= 0) it else if (epNumber in 1..vidList.size) epNumber - 1 else -1
+        }
+        if (idx < 0 || idx >= vidList.size) {
+            toast(getString(R.string.ep_picker_jump_invalid))
+            return
+        }
+        closeEpisodePicker()
+        switchEpisode(idx)
+    }
+
     private fun showExitDialog() {
         tracking = false
         val p = player
@@ -1223,6 +1515,13 @@ class PlayerActivity : AppCompatActivity() {
 
         /** tkhd 解析时读取的文件头长度（moov 通常在前 256KB 内）。 */
         private const val MOOV_PROBE_BYTES = 256 * 1024
+
+        /**
+         * 预加载窗口：提前把当前集之后 N 集下载解密进缓存，实现丝滑切集
+         * （含选集弹窗任意跳转）。单集约 5~11MB，N=5 时峰值占用约 50MB，
+         * 低内存盒子可接受；再大收益递减且挤占存储。
+         */
+        private const val PREFETCH_AHEAD = 5
 
         /** 倍速档位 */
         private val SPEEDS = floatArrayOf(0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f)

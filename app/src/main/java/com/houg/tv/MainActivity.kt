@@ -114,6 +114,9 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, HistoryActivity::class.java)
                 .putExtra(HistoryActivity.EXTRA_TAB, HistoryActivity.TAB_FAVORITE))
         }
+        findViewById<TextView>(R.id.btn_rank).setOnClickListener {
+            startActivity(Intent(this, RankActivity::class.java))
+        }
         findViewById<TextView>(R.id.btn_log).setOnClickListener {
             startActivity(Intent(this, LogActivity::class.java))
         }

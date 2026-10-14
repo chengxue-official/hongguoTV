@@ -40,7 +40,20 @@ object UpdateChecker {
      */
     const val HOST = "https://hongguo.kdns.fr"
 
-    private fun updateUrl(): String = HOST.trimEnd('/') + "/update.json"
+    /**
+     * 检查更新的候选域名（按顺序尝试，任一成功即采用其返回）。
+     * 背景：有用户反馈「SSL handshake aborted ... Connection reset by peer」——
+     * Cloudflare 自定义域名在部分运营商/地区网络下会被干扰重置。多列一个备用源，
+     * 主域名失败时自动降级尝试，提高检查成功率。
+     * 备用：Worker 原始 workers.dev 域名（同一份静态资源，只是国内多数情况下不可达，
+     * 作为"某些网络反而只通它"的兜底）。
+     */
+    private val HOSTS = listOf(
+        "https://hongguo.kdns.fr",
+        "https://hongguotv.moyushen.workers.dev"
+    )
+
+    private fun updateUrl(host: String): String = host.trimEnd('/') + "/update.json"
 
     /** 远端版本信息。 */
     data class Remote(
@@ -55,45 +68,51 @@ object UpdateChecker {
 
     /**
      * 同步检查更新（网络操作，调用方需切 IO 线程）。
+     * 依次尝试 [HOSTS]，任一域名成功返回即采用；全部失败才报错。
      * @param currentVersionCode 本机安装的 versionCode
      */
     fun check(currentVersionCode: Int): CheckResult {
-        val host = HOST.trim()
-        if (host.isEmpty() || !host.startsWith("http")) {
-            return CheckResult(false, null, "未配置托管域名（见 UpdateChecker.HOST）")
-        }
-        return try {
-            val req = Request.Builder().url(updateUrl())
-                .header("Cache-Control", "no-cache") // 确保拿到最新 update.json 而非缓存
-                .build()
-            val resp = HttpClientProvider.get().newCall(req).execute()
+        var lastErr = "检查失败"
+        for (host in HOSTS) {
+            if (host.isBlank() || !host.startsWith("http")) continue
             try {
-                if (!resp.isSuccessful) {
-                    return CheckResult(false, null, "检查失败：HTTP ${resp.code()}")
+                val req = Request.Builder().url(updateUrl(host))
+                    .header("Cache-Control", "no-cache") // 确保拿到最新 update.json 而非缓存
+                    .build()
+                val resp = HttpClientProvider.get().newCall(req).execute()
+                try {
+                    if (!resp.isSuccessful) {
+                        lastErr = "检查失败：HTTP ${resp.code()}"
+                        continue // 换下一个域名
+                    }
+                    val text = resp.body()?.string() ?: ""
+                    val remote = parse(text, host)
+                        ?: return CheckResult(false, null, "update.json 格式错误")
+                    return if (remote.versionCode > currentVersionCode) {
+                        CheckResult(true, remote, "发现新版本 v${remote.versionName}")
+                    } else {
+                        CheckResult(false, remote, "已是最新版本 v${remote.versionName}")
+                    }
+                } finally {
+                    resp.close()
                 }
-                val text = resp.body()?.string() ?: ""
-                val remote = parse(text) ?: return CheckResult(false, null, "update.json 格式错误")
-                if (remote.versionCode > currentVersionCode) {
-                    CheckResult(true, remote, "发现新版本 v${remote.versionName}")
-                } else {
-                    CheckResult(false, remote, "已是最新版本 v${remote.versionName}")
-                }
-            } finally {
-                resp.close()
+            } catch (e: Exception) {
+                // 网络被重置/SSL 中断等：记录后尝试下一个候选域名
+                lastErr = "检查失败：" + (e.message ?: e.javaClass.simpleName)
             }
-        } catch (e: Exception) {
-            CheckResult(false, null, "检查失败：" + (e.message ?: e.javaClass.simpleName))
         }
+        return CheckResult(false, null, lastErr)
     }
 
-    private fun parse(text: String): Remote? = try {
+    private fun parse(text: String, host: String): Remote? = try {
         val o = JSONObject(text)
         val apk = o.optString("apk", "")
         if (apk.isEmpty()) null
         else Remote(
             versionCode = o.optInt("versionCode", 0),
             versionName = o.optString("versionName", "?"),
-            apkUrl = if (apk.startsWith("http")) apk else HOST.trimEnd('/') + "/" + apk.trimStart('/'),
+            // apk 用"命中成功的那个 host"拼绝对地址，避免主域名取到清单却从备用域名下载
+            apkUrl = if (apk.startsWith("http")) apk else host.trimEnd('/') + "/" + apk.trimStart('/'),
             notes = o.optString("notes", "")
         )
     } catch (e: Exception) {
@@ -102,27 +121,43 @@ object UpdateChecker {
 
     /**
      * 同步下载 APK 到应用缓存目录（网络操作，调用方需切 IO 线程）。
+     * 候选地址 = 清单命中的 URL + 各 HOSTS 拼出的同名文件，逐个尝试，
+     * 抗"检查通了但下载域名被 reset"的情况。
      * @return 下载好的文件；失败返回 null 并写 [error]。
      */
     fun download(context: Context, remote: Remote, error: StringBuilder): File? {
+        val dir = File(context.cacheDir, "update").apply { mkdirs() }
+        // 先写临时文件，完成后改名，避免中断留下半截文件被误装
+        val tmp = File(dir, "update.apk.part")
+        val target = File(dir, "hongguo-${remote.versionName}.apk")
+        val name = remote.apkUrl.substringAfterLast('/')
+        val candidates = LinkedHashSet<String>().apply {
+            add(remote.apkUrl)
+            for (h in HOSTS) add(h.trimEnd('/') + "/" + name)
+        }
+        for (url in candidates) {
+            error.setLength(0)
+            if (downloadOne(url, tmp, target, error)) return target
+        }
+        if (error.length == 0) error.append("下载失败")
+        return null
+    }
+
+    /** 下载单个 URL 到 tmp 并改名为 target。成功返回 true，否则写 [error] 返回 false。 */
+    private fun downloadOne(url: String, tmp: File, target: File, error: StringBuilder): Boolean {
         return try {
-            val dir = File(context.cacheDir, "update").apply { mkdirs() }
-            // 先写临时文件，完成后改名，避免中断留下半截文件被误装
-            val tmp = File(dir, "update.apk.part")
-            val target = File(dir, "hongguo-${remote.versionName}.apk")
             tmp.delete()
             target.delete()
-
-            val req = Request.Builder().url(remote.apkUrl).build()
+            val req = Request.Builder().url(url).build()
             val resp = HttpClientProvider.get().newCall(req).execute()
             try {
                 if (!resp.isSuccessful) {
                     error.append("下载失败：HTTP ${resp.code()}")
-                    return null
+                    return false
                 }
                 val body = resp.body() ?: run {
                     error.append("下载失败：响应为空")
-                    return null
+                    return false
                 }
                 val total = body.contentLength()
                 var written = 0L
@@ -141,20 +176,20 @@ object UpdateChecker {
                 if (total > 0 && written < total) {
                     error.append("下载不完整：$written/$total")
                     tmp.delete()
-                    return null
+                    return false
                 }
                 if (!tmp.renameTo(target)) {
                     // rename 失败（跨设备等）：直接复制
                     tmp.copyTo(target, overwrite = true)
                     tmp.delete()
                 }
-                target
+                true
             } finally {
                 resp.close()
             }
         } catch (e: Exception) {
             error.append("下载异常：" + (e.message ?: e.javaClass.simpleName))
-            null
+            false
         }
     }
 
