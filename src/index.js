@@ -12,12 +12,27 @@
  *
  * 其余请求原样交给静态资源（update.json / APK 分发不受影响）。
  *
- * KV 约束：单 value ≤ 25 MiB（App 端日志上限约 1 MB，安全）；
- * 写入时带 30 天 TTL，过期自动清理，不占空间。
+ * 存储与时效（两条策略）：
+ * 1. **限流**：同一设备 15 分钟内最多上传一次（防手抖连点 / 刷屏）。
+ *    以请求体的 deviceKey 为维度（App 端持久化的安装 ID），老版本未带时
+ *    回退用机型名。命中限流返回 429 + 剩余秒数。
+ * 2. **未被读取即清理**：上传时只给 24 小时 TTL——若一直没人查看/下载，
+ *    24 小时后自动删除，不占空间。一旦被「在线查看」或「下载」，续期到
+ *    30 天（看过的日志留得久一点，方便回头对比）。
+ *
+ * KV 约束：单 value ≤ 25 MiB（App 端日志上限约 1 MB，安全）。
  */
 
 const PREFIX = 'log:';
-const TTL_SECONDS = 60 * 60 * 24 * 30; // 30 天
+const RATE_PREFIX = 'rate:';
+
+/** 未被查看/下载时的存活时间：24 小时后自动删除 */
+const TTL_UNREAD_SECONDS = 60 * 60 * 24;
+/** 被查看/下载后的续期时长：30 天 */
+const TTL_READ_SECONDS = 60 * 60 * 24 * 30;
+/** 同一设备的上传间隔：15 分钟 */
+const RATE_WINDOW_SECONDS = 15 * 60;
+
 const MAX_BYTES = 3 * 1024 * 1024;     // 单次上传上限 3 MB
 const TOKEN_RE = /^[a-z0-9]{10}$/;
 
@@ -57,7 +72,32 @@ function byteLen(s) {
   return new TextEncoder().encode(s).length;
 }
 
-/** 上传：接收 JSON {device, time, content, title?}，落 KV，返回链接。 */
+function nowSeconds() {
+  return Math.floor(Date.now() / 1000);
+}
+
+/** 剩余限流秒数；0 表示可以上传。 */
+async function rateRemain(env, deviceKey) {
+  const raw = await env.LOGS.get(RATE_PREFIX + deviceKey, 'text');
+  if (!raw) return 0;
+  const last = parseInt(raw, 10) || 0;
+  if (!last) return 0;
+  const remain = RATE_WINDOW_SECONDS - (nowSeconds() - last);
+  return remain > 0 ? remain : 0;
+}
+
+/** 记一次上传（写限流时间戳，TTL 与窗口等长，过期自动清理）。 */
+async function rateTouch(env, deviceKey) {
+  try {
+    await env.LOGS.put(RATE_PREFIX + deviceKey, String(nowSeconds()), {
+      expirationTtl: RATE_WINDOW_SECONDS,
+    });
+  } catch (e) {
+    // 限流写入失败不应让上传失败（软限制）
+  }
+}
+
+/** 上传：接收 JSON {device, deviceKey?, time, content, title?}，落 KV，返回链接。 */
 async function handleUpload(request, env) {
   let body;
   try {
@@ -75,21 +115,43 @@ async function handleUpload(request, env) {
     return json({ code: 413, msg: `日志过大（${size} 字节，上限 ${MAX_BYTES}）` }, 413);
   }
 
+  // 限流维度：优先 deviceKey（设备唯一安装 ID），老版本回退机型名
+  const deviceKey = String(body.deviceKey || body.device || '').trim().slice(0, 64);
+  if (deviceKey) {
+    const remain = await rateRemain(env, deviceKey);
+    if (remain > 0) {
+      const mins = Math.ceil(remain / 60);
+      return json({
+        code: 429,
+        msg: `上传过于频繁，请约 ${mins} 分钟后再试`,
+        retryAfter: remain,
+      }, 429);
+    }
+  }
+
   const token = newToken();
   const record = {
     content,
     device: String(body.device || '').slice(0, 120),
+    deviceKey,
     time: String(body.time || '').slice(0, 60),
     title: String(body.title || '').slice(0, 200),
     size,
     uploadedAt: new Date().toISOString(),
+    readAt: null,
   };
 
   try {
-    await env.LOGS.put(PREFIX + token, JSON.stringify(record), { expirationTtl: TTL_SECONDS });
+    // 关键：只给 24 小时 TTL。无人查看/下载的日志会自动清掉；
+    // 被读取时由 markRead() 续期到 30 天。
+    await env.LOGS.put(PREFIX + token, JSON.stringify(record), {
+      expirationTtl: TTL_UNREAD_SECONDS,
+    });
   } catch (e) {
     return json({ code: 500, msg: '存储失败：' + (e && e.message ? e.message : e) }, 500);
   }
+
+  if (deviceKey) await rateTouch(env, deviceKey);
 
   const origin = new URL(request.url).origin;
   return json({
@@ -108,7 +170,23 @@ async function readRecord(env, token) {
   try {
     return JSON.parse(raw);
   } catch (e) {
-    return { content: raw, device: '', time: '', title: '', size: byteLen(raw) };
+    return { content: raw, device: '', time: '', title: '', size: byteLen(raw), readAt: null };
+  }
+}
+
+/**
+ * 标记「已被读取」：把 TTL 从 24 小时续到 30 天。
+ * 幂等——已标记过的直接跳过，避免每次打开查看页都重写 3MB 的 value。
+ */
+async function markRead(env, token, rec) {
+  if (!rec || rec.readAt) return;
+  rec.readAt = new Date().toISOString();
+  try {
+    await env.LOGS.put(PREFIX + token, JSON.stringify(rec), {
+      expirationTtl: TTL_READ_SECONDS,
+    });
+  } catch (e) {
+    // 续期失败不影响本次读取（日志内容已经拿到了）
   }
 }
 
@@ -116,11 +194,14 @@ async function readRecord(env, token) {
 async function handleDownload(env, token) {
   const rec = await readRecord(env, token);
   if (!rec) {
-    return new Response('日志不存在或已过期（保留 30 天）', {
+    return new Response('日志不存在或已被清理（未被查看的日志保留 1 天）', {
       status: 404,
       headers: { 'Content-Type': 'text/plain; charset=utf-8' },
     });
   }
+  // 下载即视为「已读取」：续期到 30 天
+  await markRead(env, token, rec);
+
   const dev = (rec.device || 'device').replace(/[^\w\u4e00-\u9fa5.-]+/g, '_').slice(0, 40);
   const stamp = (rec.time || rec.uploadedAt || '').replace(/[^\d]/g, '').slice(0, 14);
   const filename = `hougtime-log-${dev}-${stamp || 'now'}.txt`;
@@ -145,13 +226,17 @@ async function handleView(env, token) {
        <title>日志不存在</title>
        <body style="font-family:system-ui,-apple-system,'PingFang SC',sans-serif;
                     padding:40px 20px;text-align:center;color:#111;background:#f6f7f9">
-       <h2 style="margin:0 0 12px">日志不存在或已过期</h2>
+       <h2 style="margin:0 0 12px">日志不存在或已被清理</h2>
        <p style="color:#666;font-size:14px;line-height:1.7">
-         日志在服务器保留 <b>30 天</b>，过期后自动清理。<br>请让电视端重新点一次「上传日志」。</p>
+         未被查看/下载的日志会在上传 <b>24 小时</b> 后自动清理。<br>
+         请让电视端重新点一次「上传日志」。</p>
        </body></html>`,
       { status: 404, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
     );
   }
+
+  // 打开查看页即视为「已读取」：续期到 30 天，避免正看着就被清掉
+  await markRead(env, token, rec);
 
   const sizeKb = (rec.size / 1024).toFixed(1);
   const metaLine = [
