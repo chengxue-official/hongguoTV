@@ -7,6 +7,7 @@ import android.os.Looper
 import android.view.KeyEvent
 import android.view.SurfaceView
 import android.view.View
+import android.view.WindowManager
 import android.widget.SeekBar
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
@@ -16,6 +17,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
+import androidx.media3.common.C
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.lifecycle.Lifecycle
@@ -194,6 +196,13 @@ class PlayerActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_player)
 
+        // ===== 保活（用户反馈：看着看着自动进入屏保/电视待机）=====
+        // HQQ1 Max 等低内存盒子（总内存 823MB）上，一旦屏保/待机把本 Activity
+        // 切到后台，系统立即回收进程（日志证实 19:03:08→19:03:25 进程被杀重启）。
+        // ① 窗口常亮 FLAG_KEEP_SCREEN_ON：播放期间系统屏保永不触发（治本）。
+        //    该 Flag 只在本窗口前台有效，退出播放页/熄屏由系统自动失效，无需手动管理。
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
         seriesId = intent.getStringExtra(EXTRA_SERIES_ID) ?: ""
         title = intent.getStringExtra(EXTRA_TITLE) ?: ""
         cover = intent.getStringExtra(EXTRA_COVER) ?: ""
@@ -230,6 +239,14 @@ class PlayerActivity : AppCompatActivity() {
         player = ExoPlayer.Builder(this).build()
         player!!.setVideoSurfaceView(surfaceView)
         player!!.setAudioAttributes(AudioAttributes.DEFAULT, /*handleAudioFocus=*/true)
+        // ② 播放期间持有 CPU + Wi-Fi 唤醒锁：即便被系统熄屏/待机，缓冲与网络
+        //    请求也不会因 CPU 挂起而中断，回前台可无缝续播（配合 FLAG_KEEP_SCREEN_ON，
+        //    正常情况下根本不会走到这一步）。需 AndroidManifest 声明 WAKE_LOCK（已有）。
+        try {
+            player!!.setWakeMode(C.WAKE_MODE_NETWORK)
+        } catch (e: Exception) {
+            AppLog.d("PlayerActivity", "setWakeMode 失败: " + (e.message ?: ""))
+        }
         player!!.addListener(playerListener)
 
         updateAspectLabel()
