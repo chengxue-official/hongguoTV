@@ -22,7 +22,7 @@ object App {
 
     fun init(app: Application) {
         instance = app
-        netClient = NetClient(HttpClientProvider.get(app))
+        netClient = NetClient(HttpClientProvider.get())
         watchHistory = WatchHistory(app)
         searchHistory = SearchHistory(app)
         // 开启日志文件持久化（全量、跨启动保留），必须在第一笔日志之前

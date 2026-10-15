@@ -554,7 +554,7 @@ class PlayerActivity : AppCompatActivity() {
 
     /** 下载 → CENC 解密去封装 → 写本地明文 mp4，返回文件。运行在 IO 线程。 */
     private fun prepareClearFile(video: NetClient.VideoModel): File {
-        val downloader = CencMp4Downloader(HttpClientProvider.get(this))
+        val downloader = CencMp4Downloader(HttpClientProvider.get())
         val variants = video.variants
 
         if (variants.isNotEmpty()) {
@@ -821,7 +821,7 @@ class PlayerActivity : AppCompatActivity() {
                         }
                         withContext(Dispatchers.IO) {
                             val downloader = CencMp4Downloader(
-                                    HttpClientProvider.get(this@PlayerActivity))
+                                    HttpClientProvider.get())
                             var ok = false
                             if (video.variants.isNotEmpty()) {
                                 for (v in video.variants) {

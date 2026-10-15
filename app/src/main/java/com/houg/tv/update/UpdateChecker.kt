@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.core.content.FileProvider
 import com.houg.tv.net.HttpClientProvider
+import com.houg.tv.util.AppLog
 import okhttp3.Request
 import org.json.JSONObject
 import java.io.File
@@ -39,19 +40,29 @@ object UpdateChecker {
      * 需手动安装一次 1.0.2+ 的 APK 后才能走自动更新。
      */
     const val HOST = "https://hongguo.kdns.fr"
-
     /**
      * 检查更新的候选域名（按顺序尝试，任一成功即采用其返回）。
-     * 背景：有用户反馈「SSL handshake aborted ... Connection reset by peer」——
-     * Cloudflare 自定义域名在部分运营商/地区网络下会被干扰重置。多列一个备用源，
-     * 主域名失败时自动降级尝试，提高检查成功率。
-     * 备用：Worker 原始 workers.dev 域名（同一份静态资源，只是国内多数情况下不可达，
-     * 作为"某些网络反而只通它"的兜底）。
+     *
+     * v1.0.12 起**移除了 workers.dev 备用域名**。原因：`*.workers.dev` 在国内
+     * 遭**系统性 DNS 污染**，解析结果被投毒到 Facebook / Dropbox 的 IP 段
+     * （实测阿里 DoH 返回 `108.160.167.156`、`2a03:2880:...:face:b00c:...`，
+     * 用户端报错里是 `157.240.13.8`），**任何国内网络都连不通**。留着的唯一后果是
+     * 每次检查都白等一个 connectTimeout，并且把真实错误覆盖成它自己的超时提示。
+     *
+     * 自定义域名 hongguo.kdns.fr 的解析是干净的（阿里 DoH 返回正常 Cloudflare IP
+     * `104.21.45.26` / `172.67.208.19`），保留列表结构以便将来再加备用源。
      */
     private val HOSTS = listOf(
-        "https://hongguo.kdns.fr",
-        "https://hongguotv.moyushen.workers.dev"
+        "https://hongguo.kdns.fr"
     )
+
+    /** 每个域名的尝试次数：Cloudflare 边缘偶发 TCP/握手被重置，重试一次即可恢复。 */
+    private const val ATTEMPTS_PER_HOST = 3
+
+    /** 重试前的等待，避免连续撞上同一段网络抖动。 */
+    private const val RETRY_DELAY_MS = 400L
+
+    private const val TAG = "UpdateChecker"
 
     private fun updateUrl(host: String): String = host.trimEnd('/') + "/update.json"
 
@@ -68,40 +79,58 @@ object UpdateChecker {
 
     /**
      * 同步检查更新（网络操作，调用方需切 IO 线程）。
-     * 依次尝试 [HOSTS]，任一域名成功返回即采用；全部失败才报错。
+     * 依次尝试 [HOSTS]，每个域名试 [ATTEMPTS_PER_HOST] 次（边缘偶发抖动重试即恢复），
+     * 任一成功即采用；全部失败才报错。
+     *
+     * ⚠️ 错误信息必须**聚合**各次尝试的真实原因，绝不能只留最后一条——
+     * 旧版 lastErr 被后一个域名覆盖，报错永远显示兜底域名的超时，
+     * 用户看到「连不上 workers.dev」实则主域名早已失败，排查方向被带偏。
      * @param currentVersionCode 本机安装的 versionCode
      */
     fun check(currentVersionCode: Int): CheckResult {
-        var lastErr = "检查失败"
+        val errors = ArrayList<String>()
         for (host in HOSTS) {
             if (host.isBlank() || !host.startsWith("http")) continue
-            try {
-                val req = Request.Builder().url(updateUrl(host))
-                    .header("Cache-Control", "no-cache") // 确保拿到最新 update.json 而非缓存
-                    .build()
-                val resp = HttpClientProvider.get().newCall(req).execute()
+            for (attempt in 1..ATTEMPTS_PER_HOST) {
                 try {
-                    if (!resp.isSuccessful) {
-                        lastErr = "检查失败：HTTP ${resp.code()}"
-                        continue // 换下一个域名
+                    val req = Request.Builder().url(updateUrl(host))
+                        .header("Cache-Control", "no-cache") // 确保拿到最新 update.json 而非缓存
+                        .build()
+                    val resp = HttpClientProvider.get().newCall(req).execute()
+                    try {
+                        if (!resp.isSuccessful) {
+                            errors.add("$host HTTP ${resp.code()}")
+                            break // 该域名持续非 2xx，换下一个域名
+                        }
+                        val text = resp.body()?.string() ?: ""
+                        val remote = parse(text, host)
+                            ?: return CheckResult(false, null, "update.json 格式错误")
+                        AppLog.d(TAG, "检查更新成功 host=$host 第${attempt}次 远端=${remote.versionName}")
+                        return if (remote.versionCode > currentVersionCode) {
+                            CheckResult(true, remote, "发现新版本 v${remote.versionName}")
+                        } else {
+                            CheckResult(false, remote, "已是最新版本 v${remote.versionName}")
+                        }
+                    } finally {
+                        resp.close()
                     }
-                    val text = resp.body()?.string() ?: ""
-                    val remote = parse(text, host)
-                        ?: return CheckResult(false, null, "update.json 格式错误")
-                    return if (remote.versionCode > currentVersionCode) {
-                        CheckResult(true, remote, "发现新版本 v${remote.versionName}")
-                    } else {
-                        CheckResult(false, remote, "已是最新版本 v${remote.versionName}")
+                } catch (e: Exception) {
+                    // 网络被重置/SSL 中断/DNS 失败等：聚合真实原因后重试
+                    val why = e.message ?: e.javaClass.simpleName
+                    errors.add("$host 第${attempt}次 $why")
+                    AppLog.d(TAG, "检查更新失败 host=$host 第${attempt}次: $why")
+                    if (attempt < ATTEMPTS_PER_HOST) {
+                        try {
+                            Thread.sleep(RETRY_DELAY_MS)
+                        } catch (_: InterruptedException) {
+                        }
                     }
-                } finally {
-                    resp.close()
                 }
-            } catch (e: Exception) {
-                // 网络被重置/SSL 中断等：记录后尝试下一个候选域名
-                lastErr = "检查失败：" + (e.message ?: e.javaClass.simpleName)
             }
         }
-        return CheckResult(false, null, lastErr)
+        val msg = "检查失败：" + errors.joinToString("；")
+        AppLog.d(TAG, msg)
+        return CheckResult(false, null, msg)
     }
 
     private fun parse(text: String, host: String): Remote? = try {
@@ -135,9 +164,26 @@ object UpdateChecker {
             add(remote.apkUrl)
             for (h in HOSTS) add(h.trimEnd('/') + "/" + name)
         }
+        // 每个候选地址试 ATTEMPTS_PER_HOST 次（APK 十几 MB，边缘抖动一次就会断流），
+        // 各地址的真实原因**累积**写入 error，不要每轮清空——否则用户只看到最后一次失败。
+        error.setLength(0)
         for (url in candidates) {
-            error.setLength(0)
-            if (downloadOne(url, tmp, target, error)) return target
+            for (attempt in 1..ATTEMPTS_PER_HOST) {
+                val one = StringBuilder()
+                if (downloadOne(url, tmp, target, one)) {
+                    AppLog.d(TAG, "下载成功 $url 第${attempt}次")
+                    return target
+                }
+                AppLog.d(TAG, "下载失败 $url 第${attempt}次: $one")
+                if (error.length > 0) error.append('\n')
+                error.append("$url 第${attempt}次：").append(one)
+                if (attempt < ATTEMPTS_PER_HOST) {
+                    try {
+                        Thread.sleep(RETRY_DELAY_MS)
+                    } catch (_: InterruptedException) {
+                    }
+                }
+            }
         }
         if (error.length == 0) error.append("下载失败")
         return null
