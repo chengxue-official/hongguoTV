@@ -650,6 +650,127 @@ public final class NetClient {
 
     /* ==================== 播放（App 版） ==================== */
 
+    /**
+     * 取播放模型（video_model），返回其中的 video_model 对象。
+     *
+     * <p><b>2026-10-15 接口变更（重要）</b>：红果服务端把旧的
+     * {@code POST /novel/player/video_model/v1/} 单集接口<b>硬关停</b>了——请求
+     * 返回 HTTP 200 + 0 字节空 body（响应头 {@code X-Dsa-Origin-Status: 200}），
+     * 源站主动静默拒绝，且 6 个域名全部如此。同签名下 video_detail / catalog /
+     * search 均正常（354KB），证明签名与 device_id 有效——是接口级下线，不是风控。
+     *
+     * <p>替代接口为 {@code POST /novel/player/multi_video_model/preload/v1}，
+     * 请求体改为：
+     * <pre>
+     * {
+     *   "biz_param": { ..., "need_all_video_definition": true, "video_platform": 1024 },
+     *   "dr_scene": "preload",
+     *   "mixed_video_id_map": { "1004": [vid] }
+     * }
+     * </pre>
+     * 响应为 {@code {"code":0,"data":{"<vid>":{"video_model":"<内嵌JSON字符串>"}}}}，
+     * 内嵌字符串结构与旧接口的 video_model 完全一致（video_list / encrypt_info /
+     * video_meta 均不变），因此后续解析逻辑无需改动。
+     *
+     * <p>注意：{@code video_platform} 必须是 <b>1024</b>（旧值 3 会被拒：
+     * {@code invalid param, debug_info: "video platform invalid, param:3"}）。
+     */
+    private JSONObject fetchVideoModel(String vid) throws Exception {
+        JSONObject bizParam = new JSONObject();
+        // 对齐 zhenyong97/hongguo-downloader：完整 biz_param 字段更稳
+        bizParam.put("detail_page_version", 0);
+        bizParam.put("device_level", 3);
+        bizParam.put("disable_digg_stat", false);
+        bizParam.put("need_all_video_definition", true);
+        bizParam.put("need_mp4_align", false);
+        bizParam.put("use_os_player", false);
+        bizParam.put("use_server_dns", false);
+        bizParam.put("video_platform", 1024);
+
+        JSONObject contentTypes = new JSONObject();
+        contentTypes.put("1004", new JSONArray().put(vid));
+
+        JSONObject body = new JSONObject();
+        body.put("biz_param", bizParam);
+        body.put("dr_scene", "preload");
+        body.put("mixed_video_id_map", contentTypes);
+
+        Exception lastError = null;
+
+        // 主路径：multi_video_model/preload（单集也能用，返回 data[vid].video_model）
+        try {
+            JSONObject root = appPost("/novel/player/multi_video_model/preload/v1/", body.toString());
+            JSONObject model = extractVideoModel(root, vid);
+            if (model != null) return model;
+            lastError = new Exception("红果播放信息为空");
+        } catch (Exception e) {
+            lastError = e;
+            AppLog.INSTANCE.e(TAG, "videoModel 新接口失败，尝试非 preload 路径", e);
+        }
+
+        // 兜底：multi_video_model/v1（部分旧环境只放行该路径）
+        try {
+            JSONObject root = appPost("/novel/player/multi_video_model/v1/", body.toString());
+            JSONObject model = extractVideoModel(root, vid);
+            if (model != null) return model;
+        } catch (Exception e) {
+            AppLog.INSTANCE.e(TAG, "videoModel 非 preload 路径也失败", e);
+        }
+
+        AppLog.INSTANCE.e(TAG, "videoModel 取流失败 vid=" + vid
+                + "（新接口 multi_video_model/preload 与 v1 均无数据）", lastError);
+        throw lastError != null ? lastError : new Exception("红果播放信息为空");
+    }
+
+    /**
+     * 从 multi_video_model 响应里取出 video_model 对象。
+     * 响应形如 {@code {"code":0,"data":{"<vid>":{"video_model":"{\"video_list\":[...]}"}}}}；
+     * video_model 通常是<b>内嵌 JSON 字符串</b>，也兼容直接是对象的情况。
+     *
+     * <p><b>必须按 vid 精确匹配</b>：绝不能退化成「取 data 里第一个条目」——
+     * 那会在本集取不到时拿到<b>别的集</b>的播放地址，导致用户点第 5 集播出第 1 集。
+     * 取不到就老实返回 null，由上层报错。
+     */
+    private JSONObject extractVideoModel(JSONObject root, String vid) {
+        if (root == null) return null;
+        JSONObject data = root.optJSONObject("data");
+        if (data == null || data.length() == 0) return null;
+
+        Object entry = data.opt(vid);
+        if (entry instanceof JSONObject) {
+            JSONObject item = (JSONObject) entry;
+            JSONObject model = optModelObject(item.opt("video_model"));
+            if (model != null) return model;
+            // data[vid] 本身就是 video_model（个别形态）
+            if (item.optJSONArray("video_list") != null) return item;
+            return null;
+        }
+
+        // 兼容：响应没有按 vid 分组，data 直接就是 model（或 model 的包装）。
+        // 这种情况无法校验归属，仅在最新接口形态下作为兜底。
+        JSONObject model = optModelObject(data.opt("video_model"));
+        if (model != null) return model;
+        if (data.optJSONArray("video_list") != null) return data;
+
+        AppLog.INSTANCE.e(TAG, "videoModel 响应缺少 vid=" + vid + " 条目（data keys 数=" + data.length() + "）", null);
+        return null;
+    }
+
+    /** video_model 既可能是内嵌 JSON 字符串，也可能是对象；统一转成 JSONObject。 */
+    private JSONObject optModelObject(Object value) {
+        if (value instanceof JSONObject) return (JSONObject) value;
+        if (value instanceof String) {
+            String s = ((String) value).trim();
+            if (!s.isEmpty()) {
+                try {
+                    return new JSONObject(s);
+                } catch (Exception ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
     public VideoModel videoModel(String vid) throws Exception {
         return videoModel(vid, 0);
     }
@@ -664,26 +785,8 @@ public final class NetClient {
      */
     public VideoModel videoModel(String vid, int maxHeight) throws Exception {
         AppLog.INSTANCE.d(TAG, "videoModel video_id=" + vid);
-
-        JSONObject bizParam = new JSONObject();
-        bizParam.put("need_all_video_definition", true);
-        bizParam.put("video_platform", 3);
-        JSONObject body = new JSONObject();
-        body.put("video_id", vid);
-        body.put("content_type", 1);
-        body.put("biz_param", bizParam);
-
-        JSONObject root = appPost("/novel/player/video_model/v1/", body.toString());
-        JSONObject data = root.optJSONObject("data");
-        if (data == null) throw new Exception("红果播放接口未返回数据");
-
-        JSONObject model = data.optJSONObject("video_model");
-        if (model == null) {
-            String s = data.optString("video_model");
-            if (s != null && !s.isEmpty()) model = new JSONObject(s);
-        }
+        JSONObject model = fetchVideoModel(vid);
         if (model == null) throw new Exception("红果播放信息为空");
-
         // 收集 bytevc1(HEVC) 变体：只跳过 bytevc2（AV1），按高度降序选最优
         List<Variant> variants = new ArrayList<>();
         Exception keyErr = null;
