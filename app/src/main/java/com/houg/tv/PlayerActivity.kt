@@ -426,6 +426,10 @@ class PlayerActivity : AppCompatActivity() {
                     danmakuView.setPositionMs(target)
                     recordHistory(force = true)
                     if (wasPlayingBeforeSeek) exo.play()
+                } else {
+                    // duration 读不到（prepare 未完成）：不 seek，但要把暂停态还回去，
+                    // 否则会出现「拖一下就没声/不动了」。
+                    if (wasPlayingBeforeSeek) exo.play()
                 }
                 showControls()
             }
