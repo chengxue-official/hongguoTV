@@ -51,8 +51,25 @@ object DeviceInfo {
         }
     }
 
-    /** 总内存（MB），读 /proc/meminfo，失败返回 -1。 */
-    private fun totalMemoryMb(): Long {
+    /**
+     * 低端设备判定：硬解 1080p HEVC 会吃力的设备。
+     *
+     * 依据（来自线上日志）：
+     *  - Android 5.x（API 21/22，2015 年前后芯片）：HEVC 硬解能力弱，
+     *    且倍速播放时解码吞吐要求翻倍，1.5x 起普遍掉帧。
+     *  - 总内存 < 1.5GB：这类盒子/电视通常同时是低端 SoC。
+     *
+     * 命中后由 [com.houg.tv.net.NetClient.videoModel] 把清晰度上限压到 720p，
+     * 让解码器有余量，倍速与 seek 才不会卡。
+     */
+    fun isLowEndDevice(): Boolean {
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.LOLLIPOP_MR1) return true  // API ≤ 22
+        val mem = totalMemoryMb()
+        return mem in 1..1536
+    }
+
+    /** 总内存（MB），读 /proc/meminfo，失败返回 -1。供低端设备判定（选清晰度上限）复用。 */
+    fun totalMemoryMb(): Long {
         return try {
             val br = File("/proc/meminfo").bufferedReader()
             br.useLines { lines ->

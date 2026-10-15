@@ -31,6 +31,7 @@ import com.houg.tv.playback.CencMp4Downloader
 import com.houg.tv.playback.CencMp4Parser
 import com.houg.tv.playback.CencMp4Remuxer
 import com.houg.tv.util.AppLog
+import com.houg.tv.util.DeviceInfo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -70,6 +71,10 @@ class PlayerActivity : AppCompatActivity() {
 
     private var player: ExoPlayer? = null
     private var tracking = false
+    /** 拖动进度条时预览的目标位置（ms）；0 表示无预览。松手后才真正 seek。 */
+    private var seekBarPreviewMs = 0L
+    /** 拖动进度条前是否处于播放态：松手后据此决定要不要自动恢复播放。 */
+    private var wasPlayingBeforeSeek = false
     /** 切后台前记录的播放进度（ms），恢复时 seek 到该位置 */
     private var resumePosition = 0
 
@@ -229,7 +234,7 @@ class PlayerActivity : AppCompatActivity() {
                     AppLog.d("PlayerActivity", "疑似本地缓存损坏(" + error.errorCodeName
                             + ")，删除重下 vid=$badVid")
                     try {
-                        File(cacheDir, "clear_$badVid.mp4").delete()
+                        clearFile(badVid).delete()
                     } catch (e: Throwable) {
                         AppLog.d("PlayerActivity", "删除坏缓存失败: " + (e.message ?: ""))
                     }
@@ -381,16 +386,47 @@ class PlayerActivity : AppCompatActivity() {
 
         seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
+                // ⚠️ 拖动过程中**绝不下发 seekTo**。
+                // 用户每挪一格进度条就触发一次 onProgressChanged，一次拖动可达几十次；
+                // 每次 seekTo 都会 flush 解码器并重新从关键帧解码（HEVC 在老设备上单次
+                // seek 就要几百毫秒）。几十次连发的结果就是：解码器/音频输出被反复重置，
+                // 轻则卡死无响应，重则音频通道初始化失败 → 一直没声音。
+                // 正确做法：拖动期间只更新本地预览文案，松手（onStopTrackingTouch）才 seek 一次。
                 if (fromUser) {
-                    val exo = player ?: return
-                    val dur = exo.duration
-                    if (dur > 0) exo.seekTo(p.toLong() * dur / 1000)
+                    val dur = player?.duration ?: 0L
+                    if (dur > 0) {
+                        seekBarPreviewMs = p.toLong() * dur / 1000
+                        positionText.text = formatMs(seekBarPreviewMs)
+                    }
                 }
             }
 
-            override fun onStartTrackingTouch(sb: SeekBar) { tracking = true }
+            override fun onStartTrackingTouch(sb: SeekBar) {
+                tracking = true
+                seekBarPreviewMs = 0L
+                // 拖动期间先暂停，避免「一边播一边被反复 seek」叠加解码压力；
+                // 松手后再按播放状态恢复。
+                wasPlayingBeforeSeek = player?.isPlaying == true
+                player?.pause()
+            }
+
             override fun onStopTrackingTouch(sb: SeekBar) {
                 tracking = false
+                val exo = player ?: return
+                val dur = exo.duration
+                if (dur > 0) {
+                    val target = seekBarPreviewMs.takeIf { it > 0 }
+                            ?: (sb.progress.toLong() * dur / 1000)
+                    // 用户手动拖动：作废待执行的续播 seek（READY 回调会覆盖用户刚拖的位置）
+                    pendingResumeMs = 0L
+                    val gen = playGen
+                    skipSeekGroup(gen)
+                    exo.seekTo(target)
+                    // 弹幕重基准 + 落盘历史（用准确的 target，seekTo 后 currentPosition 可能还是旧值）
+                    danmakuView.setPositionMs(target)
+                    recordHistory(force = true)
+                    if (wasPlayingBeforeSeek) exo.play()
+                }
                 showControls()
             }
         })
@@ -455,7 +491,7 @@ class PlayerActivity : AppCompatActivity() {
                     return@launch
                 }
                 val video = withContext(Dispatchers.IO) {
-                    App.netClient.videoModel(vid)
+                    App.netClient.videoModel(vid, maxVariantHeight())
                 }
                 if (gen != playGen) return@launch
                 val clearFile = withContext(Dispatchers.IO) { prepareClearFile(video) }
@@ -477,10 +513,35 @@ class PlayerActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * 当前设备的清晰度上限（像素高）。低端设备（Android 5.x / 小内存）返回 720，
+     * 其余返回 0（不限制）。见 [com.houg.tv.util.DeviceInfo.isLowEndDevice]。
+     *
+     * 温馨提醒：这类设备硬解 1080p HEVC 本就贴着上限，倍速 ≥1.5x 或频繁 seek
+     * 时解码吞吐跟不上，表现为卡顿 / 无声。降档 720p 是代价最小、见效最直接的缓解。
+     */
+    private fun maxVariantHeight(): Int = variantCapHeight
+
+    /** 设备清晰度上限：运行期恒定，只判定一次（isLowEndDevice 会读 /proc/meminfo）。 */
+    private val variantCapHeight: Int by lazy {
+        try {
+            if (DeviceInfo.isLowEndDevice()) 720 else 0
+        } catch (e: Throwable) {
+            0
+        }
+    }
+
+    /**
+     * 明文缓存文件。**文件名带清晰度档**（720/full），避免低端设备降档后
+     * 误命中其它档位遗留的旧缓存——否则限高形同虚设，仍会拿 1080p 去硬解。
+     */
+    private fun clearFile(vid: String): File =
+        File(cacheDir, "clear_" + vid + "_" + (if (variantCapHeight > 0) "720" else "full") + ".mp4")
+
     /** 查找该 vid 已预加载的明文缓存文件（存在且非空才算命中）。 */
     private fun findCachedClearFile(vid: String): File? {
         return try {
-            val f = File(cacheDir, "clear_$vid.mp4")
+            val f = clearFile(vid)
             if (f.exists() && f.length() > 1024) f else null
         } catch (e: Exception) {
             null
@@ -499,7 +560,7 @@ class PlayerActivity : AppCompatActivity() {
                     val t0 = System.currentTimeMillis()
                     val enc = downloader.downloadWithRetry(v.urls)
                     val clear = CencMp4Remuxer.remux(enc, v.cencKey)
-                    val file = File(cacheDir, "clear_" + video.videoId + ".mp4")
+                    val file = clearFile(video.videoId)
                     file.writeBytes(clear)
                     parseTkhd(file)
                     AppLog.d("PlayerActivity", "prepareClearFile codec=" + v.codec
@@ -516,7 +577,7 @@ class PlayerActivity : AppCompatActivity() {
             try {
                 val enc = downloader.downloadWithRetry(video.urls)
                 val clear = CencMp4Remuxer.remux(enc, video.cencKey)
-                val file = File(cacheDir, "clear_" + video.videoId + ".mp4")
+                val file = clearFile(video.videoId)
                 file.writeBytes(clear)
                 parseTkhd(file)
                 return file
@@ -751,7 +812,9 @@ class PlayerActivity : AppCompatActivity() {
                     if (findCachedClearFile(vid) != null) continue
                     try {
                         AppLog.d("PlayerActivity", "预加载 pos=$pos vid=$vid")
-                        val video = withContext(Dispatchers.IO) { App.netClient.videoModel(vid) }
+                        val video = withContext(Dispatchers.IO) {
+                            App.netClient.videoModel(vid, maxVariantHeight())
+                        }
                         withContext(Dispatchers.IO) {
                             val downloader = CencMp4Downloader(
                                     HttpClientProvider.get(this@PlayerActivity))
@@ -762,8 +825,7 @@ class PlayerActivity : AppCompatActivity() {
                                     try {
                                         val clear = CencMp4Remuxer.remux(
                                                 downloader.downloadWithRetry(v.urls), v.cencKey)
-                                        File(cacheDir, "clear_" + video.videoId + ".mp4")
-                                                .writeBytes(clear)
+                                        clearFile(video.videoId).writeBytes(clear)
                                         ok = true
                                         break
                                     } catch (e: Exception) {
@@ -775,8 +837,7 @@ class PlayerActivity : AppCompatActivity() {
                                 try {
                                     val clear = CencMp4Remuxer.remux(
                                             downloader.downloadWithRetry(video.urls), video.cencKey)
-                                    File(cacheDir, "clear_" + video.videoId + ".mp4")
-                                            .writeBytes(clear)
+                                    clearFile(video.videoId).writeBytes(clear)
                                     ok = true
                                 } catch (e: Exception) {
                                     AppLog.e("PlayerActivity", "预加载兜底失败", e)
@@ -1001,6 +1062,9 @@ class PlayerActivity : AppCompatActivity() {
     /**
      * 删除 cacheDir 下 clear_ 前缀的明文临时文件。
      * @param keep 需保留的 vid 集合（当前集与预加载的下一集）；为 null 时全清。
+     *
+     * 文件名有两种形态：新版 `clear_<vid>_720.mp4` / `clear_<vid>_full.mp4`（带清晰度档），
+     * 旧版 `clear_<vid>.mp4`。这里统一剥离前缀/后缀与档位标记还原 vid。
      */
     private fun cleanupClearFiles(keep: Set<String?>? = null) {
         try {
@@ -1008,6 +1072,7 @@ class PlayerActivity : AppCompatActivity() {
                 if (!f.name.startsWith("clear_")) return@forEach
                 if (keep != null) {
                     val name = f.name.removePrefix("clear_").removeSuffix(".mp4")
+                        .removeSuffix("_720").removeSuffix("_full")
                     if (keep.contains(name)) return@forEach
                 }
                 f.delete()
@@ -1216,16 +1281,26 @@ class PlayerActivity : AppCompatActivity() {
         val step = QUICK_SEEK_MS * (1 + repeatCount.coerceAtMost(MAX_SEEK_REPEAT).toLong())
         val target = (p.currentPosition + dir * step).coerceIn(0L, dur)
         p.seekTo(target)
-        // 往回跳时清掉已拉取窗口标记，允许重新拉取（往前跳旧窗口数据仍有效，避免重复请求）。
-        // DanmakuView.setPositionMs 会自行识别位置跳变并重基准在途弹幕，无需在此手动清理。
-        if (dir < 0) {
-            danmakuFetchedWindows.clear()
-            lastDanmakuWindow = -1L
-        }
+        skipSeekGroup(playGen)
         danmakuView.setPositionMs(target)
+        recordHistory(force = true)
         showControls()
         toast(if (dir > 0) getString(R.string.seek_forward, (step / 1000).toString() + "s")
         else getString(R.string.seek_backward, (step / 1000).toString() + "s"))
+    }
+
+    /**
+     * 位置发生大幅跳变（快进快退 / 拖动进度条）后同步附属状态。
+     *
+     * ① 清掉弹幕「已拉取窗口」标记：跳转后旧窗口的判定不再成立，不清会导致
+     *    跳到新位置后迟迟不出弹幕（要等下一个 30s 自然窗口才拉）。
+     * ② 弹幕视图重基准在途弹幕（DanmakuView.setPositionMs 内部会识别位置跳变）。
+     * ③ 落盘一次历史，避免跳转后立刻退出丢失进度。
+     */
+    private fun skipSeekGroup(gen: Int) {
+        if (gen != playGen) return
+        danmakuFetchedWindows.clear()
+        lastDanmakuWindow = -1L
     }
 
     /* ==================== 退出 ==================== */

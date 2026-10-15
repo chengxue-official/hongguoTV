@@ -651,6 +651,18 @@ public final class NetClient {
     /* ==================== 播放（App 版） ==================== */
 
     public VideoModel videoModel(String vid) throws Exception {
+        return videoModel(vid, 0);
+    }
+
+    /**
+     * 取播放信息。
+     *
+     * @param maxHeight 清晰度上限（像素高）；&lt;=0 表示不限制。低端设备（Android 5.x /
+     *                  小内存）由调用方传入 720，把 1080p 变体过滤掉——否则硬解
+     *                  1080p HEVC 本就贴着上限，倍速或 seek 时必然掉帧/卡死。
+     *                  仅当存在不超过上限的变体时才过滤，保证任何设备都有可播源。
+     */
+    public VideoModel videoModel(String vid, int maxHeight) throws Exception {
         AppLog.INSTANCE.d(TAG, "videoModel video_id=" + vid);
 
         JSONObject bizParam = new JSONObject();
@@ -709,6 +721,23 @@ public final class NetClient {
             }
         });
 
+        // ===== 低端设备:限制清晰度上限 =====
+        // 1080p HEVC 在 Android 5.x / 小内存设备上硬解余量极小,倍速(≥1.5x)或
+        // 拖动 seek 时解码吞吐跟不上 → 掉帧卡顿、音频来不及初始化而无声。
+        // 降一档到 720p 给解码器留出余量,观感损失远小于卡顿。
+        // 只在「确实存在不超上限的变体」时才过滤,避免某些剧只有 1080p 时反而无源可播。
+        int cappedHeight = 0;
+        if (maxHeight > 0) {
+            List<Variant> lower = new ArrayList<>();
+            for (Variant v : variants) {
+                if (v.height > 0 && v.height <= maxHeight) lower.add(v);
+            }
+            if (!lower.isEmpty() && lower.size() < variants.size()) {
+                cappedHeight = variants.get(0).height;
+                variants = lower;
+            }
+        }
+
         if (variants.isEmpty()) {
             if (keyErr != null) {
                 throw new Exception("红果媒体密钥不可用");
@@ -722,7 +751,8 @@ public final class NetClient {
         Variant selected = variants.get(0);
         AppLog.INSTANCE.d(TAG, "videoModel 取得 " + variants.size() + " 个变体，选中 codec="
                 + selected.codec + " height=" + selected.height + " encrypted=" + selected.encrypted
-                + " urls=" + selected.urls.size() + " duration=" + duration);
+                + " urls=" + selected.urls.size() + " duration=" + duration
+                + (cappedHeight > 0 ? " [低端设备限高 " + maxHeight + "p，已从 " + cappedHeight + "p 降档]" : ""));
         return new VideoModel(vid, selected.urls, duration, "https://novel.snssdk.com/",
                 selected.cencKey, selected.encrypted, variants, selected.codec, selected.height);
     }
