@@ -61,19 +61,39 @@
             android:clickable="true" />
 
         <TextView
-            android:id="@+id/btn_keyboard"
+            android:id="@+id/btn_lan_input"
             android:layout_width="wrap_content"
             android:layout_height="40dp"
             android:layout_marginStart="12dp"
             android:gravity="center"
             android:paddingStart="16dp"
             android:paddingEnd="16dp"
-            android:text="@string/keyboard"
+            android:text="@string/lan_input"
             android:textColor="@color/text_primary"
             android:textSize="15sp"
             android:background="@drawable/button_bg"
             android:focusable="true"
             android:clickable="true" />
+    </LinearLayout>
+
+    <!-- 局域网跨屏输入提示（点「手机输入」后显示访问地址） -->
+    <LinearLayout
+        android:id="@+id/lan_panel"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingStart="16dp"
+        android:paddingEnd="16dp"
+        android:paddingBottom="8dp"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/lan_hint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="@color/text_secondary"
+            android:textSize="14sp" />
     </LinearLayout>
 
     <!-- 搜索记录（有记录时显示，支持逐条点击复搜 + 清空） -->
@@ -161,12 +181,5 @@
             android:textSize="15sp"
             android:visibility="gone" />
     </FrameLayout>
-
-    <!-- 内置软键盘（部分电视无法唤起系统键盘时兜底） -->
-    <FrameLayout
-        android:id="@+id/soft_keyboard_container"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:visibility="gone" />
 
 </LinearLayout>

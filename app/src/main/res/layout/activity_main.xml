@@ -14,14 +14,30 @@
         android:paddingStart="20dp"
         android:paddingEnd="20dp">
 
-        <TextView
-            android:id="@+id/app_title"
+        <LinearLayout
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="@string/app_name"
-            android:textColor="@color/text_primary"
-            android:textSize="20sp"
-            android:textStyle="bold" />
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/app_title"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/app_name"
+                android:textColor="@color/text_primary"
+                android:textSize="20sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/community_hint"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:text="@string/community_hint"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp"
+                android:maxLines="1" />
+        </LinearLayout>
 
         <!-- 分类 Tab -->
         <LinearLayout

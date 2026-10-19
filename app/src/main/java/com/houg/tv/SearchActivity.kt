@@ -1,19 +1,17 @@
 package com.houg.tv
 
-import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import android.view.View
 import android.view.inputmethod.EditorInfo
-import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
-import android.widget.FrameLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import com.houg.tv.net.LanInputServer
 import com.houg.tv.net.NetClient
 import com.houg.tv.repo.DramaIndex
 import kotlinx.coroutines.CoroutineScope
@@ -24,10 +22,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * 搜索页：支持三种搜索方式 + 内置软键盘兜底。
+ * 搜索页：支持三种搜索方式 + 局域网跨屏输入。
  * 1. 全名/关键词搜索：服务端 /search/<词>（红果自有搜索接口）。
  * 2. 拼音首字母搜索：本地片名索引（剧名→拼音首字母），输入纯字母时匹配。
- * 3. 内置软键盘：部分电视无法唤起系统键盘时，用 App 内键盘输入。
+ * 3. 局域网跨屏输入：电视起本地 HTTP 服务，手机同 Wi-Fi 打开提示网址，
+ *    在手机网页上打字回传搜索 —— 取代内置软键盘（遥控器打字体验差，
+ *    系统输入法在老盒子上又常唤不出来）。
  */
 class SearchActivity : AppCompatActivity() {
 
@@ -36,11 +36,13 @@ class SearchActivity : AppCompatActivity() {
     private lateinit var input: EditText
     private lateinit var progress: View
     private lateinit var statusText: TextView
-    private lateinit var keyboardContainer: FrameLayout
-    private var softKeyboard: SoftKeyboard? = null
     private lateinit var historyPanel: View
     private lateinit var historyChips: RecyclerView
     private lateinit var historyAdapter: SearchChipAdapter
+    private lateinit var lanPanel: View
+    private lateinit var lanHint: TextView
+    /** 局域网跨屏输入服务（仅本页存活期间运行） */
+    private var lanServer: LanInputServer? = null
     /** 搜索代次：快速连续搜索时丢弃过期响应 */
     private var searchGen = 0
     /** 本地片名索引是否已就绪 */
@@ -53,9 +55,10 @@ class SearchActivity : AppCompatActivity() {
         input = findViewById(R.id.search_input)
         progress = findViewById(R.id.progress)
         statusText = findViewById(R.id.status_text)
-        keyboardContainer = findViewById(R.id.soft_keyboard_container)
         historyPanel = findViewById(R.id.history_panel)
         historyChips = findViewById(R.id.history_chips)
+        lanPanel = findViewById(R.id.lan_panel)
+        lanHint = findViewById(R.id.lan_hint)
         val recycler = findViewById<RecyclerView>(R.id.recycler)
 
         adapter = DramaAdapter { drama -> openDetail(drama) }
@@ -81,7 +84,7 @@ class SearchActivity : AppCompatActivity() {
 
         findViewById<View>(R.id.btn_back).setOnClickListener { finish() }
         findViewById<View>(R.id.btn_do_search).setOnClickListener { doSearch() }
-        findViewById<View>(R.id.btn_keyboard).setOnClickListener { toggleKeyboard() }
+        findViewById<View>(R.id.btn_lan_input).setOnClickListener { toggleLanInput() }
         findViewById<View>(R.id.btn_clear_history).setOnClickListener { confirmClearHistory() }
 
         input.setOnEditorActionListener { _, actionId, _ ->
@@ -90,13 +93,6 @@ class SearchActivity : AppCompatActivity() {
                 true
             } else false
         }
-        // 输入框聚焦时展示内置软键盘（TV 上系统键盘可能唤不出）
-        input.setOnFocusChangeListener { _, hasFocus ->
-            if (hasFocus) showKeyboard() else hideKeyboard()
-        }
-
-        // 初始化内置软键盘
-        initSoftKeyboard()
 
         // 先读本地索引；若缺失则后台重建
         val cached = DramaIndex.load(this)
@@ -108,11 +104,6 @@ class SearchActivity : AppCompatActivity() {
         renderSearchHistory()
 
         input.requestFocus()
-        // TV 上主动唤起系统软键盘（有则用，无则靠内置键盘兜底）
-        input.postDelayed({
-            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-            imm?.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
-        }, 300)
     }
 
     /* ==================== 搜索记录 ==================== */
@@ -142,48 +133,42 @@ class SearchActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun initSoftKeyboard() {
-        val kb = SoftKeyboard(this)
-        kb.setOnKey { c -> appendChar(c) }
-        kb.setOnCmd { cmd ->
-            when (cmd) {
-                SoftKeyboard.Cmd.BACKSPACE -> backspace()
-                SoftKeyboard.Cmd.CLEAR -> { input.setText(""); showKeyboard() }
-                SoftKeyboard.Cmd.SPACE -> appendChar(' ')
-                SoftKeyboard.Cmd.SEARCH -> doSearch()
-            }
+    /* ==================== 局域网跨屏输入 ==================== */
+
+    /**
+     * 开关局域网输入：开启后在 TV 上起本地 HTTP 服务，页面提示手机访问地址。
+     * 手机与 TV 需在同一 Wi-Fi；手机打开网址 → 输入剧名 → 回传后立即搜索。
+     */
+    private fun toggleLanInput() {
+        if (lanServer != null) {
+            stopLanInput()
+            return
         }
-        softKeyboard = kb
-        keyboardContainer.addView(kb)
+        val server = LanInputServer { keyword ->
+            input.setText(keyword)
+            input.setSelection(keyword.length)
+            doSearch()
+        }
+        val port = server.start()
+        val address = server.localAddress()
+        if (port == 0 || address == null) {
+            server.stop()
+            lanHint.text = getString(R.string.lan_input_unavailable)
+            lanPanel.visibility = View.VISIBLE
+            Toast.makeText(this, R.string.lan_input_unavailable, Toast.LENGTH_LONG).show()
+            return
+        }
+        lanServer = server
+        val url = "http://$address:$port"
+        lanHint.text = getString(R.string.lan_input_hint, url)
+        lanPanel.visibility = View.VISIBLE
+        Toast.makeText(this, getString(R.string.lan_input_hint, url), Toast.LENGTH_LONG).show()
     }
 
-    private fun appendChar(c: Char) {
-        val cur = input.text.toString()
-        val sel = input.selectionStart.coerceIn(0, cur.length)
-        val next = cur.substring(0, sel) + c + cur.substring(sel)
-        input.setText(next)
-        input.setSelection(sel + 1)
-    }
-
-    private fun backspace() {
-        val cur = input.text.toString()
-        if (cur.isEmpty()) return
-        val sel = input.selectionStart.coerceIn(1, cur.length)
-        val next = cur.substring(0, sel - 1) + cur.substring(sel)
-        input.setText(next)
-        input.setSelection(sel - 1)
-    }
-
-    private fun toggleKeyboard() {
-        if (keyboardContainer.visibility == View.VISIBLE) hideKeyboard() else showKeyboard()
-    }
-
-    private fun showKeyboard() {
-        keyboardContainer.visibility = View.VISIBLE
-    }
-
-    private fun hideKeyboard() {
-        keyboardContainer.visibility = View.GONE
+    private fun stopLanInput() {
+        lanServer?.stop()
+        lanServer = null
+        lanPanel.visibility = View.GONE
     }
 
     /** 后台重建片名索引（首次进入且无本地缓存时）。 */
@@ -210,11 +195,7 @@ class SearchActivity : AppCompatActivity() {
         // 记入搜索历史（去重上浮），并刷新胶囊区
         App.searchHistory.add(keyword)
         renderSearchHistory()
-        // 收起系统软键盘，避免遮挡结果列表
-        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-        imm?.hideSoftInputFromWindow(input.windowToken, 0)
         input.clearFocus()
-        hideKeyboard()
         findViewById<View>(R.id.btn_do_search).requestFocus()
 
         searchGen++
@@ -325,6 +306,7 @@ class SearchActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        stopLanInput()
         scope.cancel()
         super.onDestroy()
     }

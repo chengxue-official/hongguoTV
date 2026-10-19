@@ -93,6 +93,15 @@ class PlayerActivity : AppCompatActivity() {
     private var shouldBePlaying = true
     /** 当前画幅模式下标，见 ASPECT_MODES */
     private var aspectMode = 0
+    /**
+     * 当前清晰度档位下标，见 QUALITY_MODES。
+     * 「自动」沿用设备能力判定（低端设备压 720），其余档位由用户显式指定上限。
+     */
+    private var qualityIndex = 0
+    /** 本集实际取到的清晰度高度（videoModel 返回），0 表示未知（如命中本地缓存）。 */
+    private var currentVariantHeight = 0
+    /** 用户刚切过清晰度：下次 STATE_READY 提示一次实际生效档位（服务端可能无该档而回退）。 */
+    private var pendingQualityHint = false
 
     /** 本集起播时是否已经做过「续播 seek」（避免重复 seek 打断用户手动拖动） */
     private var resumedThisEpisode = false
@@ -142,9 +151,11 @@ class PlayerActivity : AppCompatActivity() {
     private lateinit var durationText: TextView
     private lateinit var toastHint: TextView
     private lateinit var menuFill: TextView
+    private lateinit var menuQuality: TextView
     private lateinit var menuDanmaku: TextView
     private lateinit var menuSpeed: TextView
     private lateinit var menuEpisodes: TextView
+    private lateinit var menuDecoder: TextView
     private lateinit var menuExit: TextView
     private lateinit var progress: View
     private lateinit var errorText: TextView
@@ -166,6 +177,11 @@ class PlayerActivity : AppCompatActivity() {
 
     private var speedIndex = 2
     private var danmakuEnabled = true
+    /**
+     * 解码方式：true=软解（强制走 Audio/Video 软解码器），false=硬解（默认，交给系统 MediaCodec）。
+     * 老盒子/投影仪上硬解 HEVC 常出现花屏、绿边、解码器初始化失败，用户可在播放菜单里切软解救急。
+     */
+    private var decoderSoft = false
     private val danmakuFetchedWindows = mutableSetOf<Long>()
     private var lastDanmakuWindow = -1L
     /**
@@ -189,6 +205,7 @@ class PlayerActivity : AppCompatActivity() {
                 Player.STATE_READY -> {
                     releaseSwitchGuard()
                     applyPendingResume()
+                    notifyQualityIfNeeded()
                 }
                 Player.STATE_ENDED -> onEpisodeComplete()
             }
@@ -210,6 +227,22 @@ class PlayerActivity : AppCompatActivity() {
                 videoHeight = size.height
             }
             applyAspectRatio()
+        }
+
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            // 边栏只在「暂停」与「拖动进度条」时常驻；恢复播放立即收起。
+            if (isPlaying) {
+                handler.removeCallbacks(hideControlsRunnable)
+                if (!tracking) {
+                    topBar.visibility = View.GONE
+                    controlBar.visibility = View.GONE
+                }
+            } else if (!switchingEpisode
+                    && player?.playbackState == Player.STATE_READY) {
+                // 只有「真正就绪且处于暂停」才算用户暂停；起播/切集的缓冲态
+                // （IDLE/BUFFERING）即便 isPlaying=false 也不弹边栏。
+                showControls()
+            }
         }
 
         override fun onPlayerError(error: PlaybackException) {
@@ -315,9 +348,11 @@ class PlayerActivity : AppCompatActivity() {
         durationText = findViewById(R.id.duration_text)
         toastHint = findViewById(R.id.toast_hint)
         menuFill = findViewById(R.id.menu_fill)
+        menuQuality = findViewById(R.id.menu_quality)
         menuDanmaku = findViewById(R.id.menu_danmaku)
         menuSpeed = findViewById(R.id.menu_speed)
         menuEpisodes = findViewById(R.id.menu_episodes)
+        menuDecoder = findViewById(R.id.menu_decoder)
         menuExit = findViewById(R.id.menu_exit)
         progress = findViewById(R.id.progress)
         errorText = findViewById(R.id.error_text)
@@ -338,8 +373,11 @@ class PlayerActivity : AppCompatActivity() {
             .coerceIn(0, ASPECT_MODES.size - 1)
         speedIndex = prefs.getInt(PREF_SPEED, 2).coerceIn(0, SPEEDS.size - 1)
         danmakuEnabled = prefs.getBoolean(PREF_DANMAKU, true)
+        decoderSoft = prefs.getBoolean(PREF_DECODER_SOFT, false)
+        qualityIndex = prefs.getInt(PREF_QUALITY, QUALITY_AUTO)
+            .coerceIn(0, QUALITY_MODES.size - 1)
 
-        player = ExoPlayer.Builder(this).build()
+        player = buildPlayer()
         player!!.setVideoSurfaceView(surfaceView)
         player!!.setAudioAttributes(AudioAttributes.DEFAULT, /*handleAudioFocus=*/true)
         // ② 播放期间持有 CPU + Wi-Fi 唤醒锁：即便被系统熄屏/待机，缓冲与网络
@@ -353,13 +391,18 @@ class PlayerActivity : AppCompatActivity() {
         player!!.addListener(playerListener)
 
         updateAspectLabel()
+        updateQualityLabel()
         updateSpeedLabel()
         updateDanmakuLabel()
+        updateDecoderLabel()
         applyDanmakuVisibility()
         updateEpisodeInfo()
         bindControls()
 
-        showControls()
+        // 起播时不显示边栏（用户诉求：只有暂停或拖进度条才显示）。
+        // 顶栏集信息仍会随「切集/暂停」出现，起播画面保持干净。
+        topBar.visibility = View.GONE
+        controlBar.visibility = View.GONE
         // 初始焦点交给隐形锚点：播放页不需要焦点导航，全部按键由 onKeyDown 处理。
         // 若不指定，TV 可能把焦点给到某个可聚焦控件（历史版本曾落在 SeekBar 上，
         // 导致左右键被 SeekBar 吃掉、快进快退失效）。
@@ -372,9 +415,11 @@ class PlayerActivity : AppCompatActivity() {
 
     private fun bindControls() {
         menuFill.setOnClickListener { cycleAspect() }
+        menuQuality.setOnClickListener { cycleQuality() }
         menuDanmaku.setOnClickListener { toggleDanmaku() }
         menuSpeed.setOnClickListener { cycleSpeed() }
         menuEpisodes.setOnClickListener { openEpisodePicker() }
+        menuDecoder.setOnClickListener { cycleDecoder() }
         menuExit.setOnClickListener { showExitDialog() }
 
         epBtnClose.setOnClickListener { closeEpisodePicker() }
@@ -404,6 +449,8 @@ class PlayerActivity : AppCompatActivity() {
             override fun onStartTrackingTouch(sb: SeekBar) {
                 tracking = true
                 seekBarPreviewMs = 0L
+                // 拖动进度条属于用户明确诉求的「要显示边栏」场景：主动亮出进度条
+                showControls()
                 // 拖动期间先暂停，避免「一边播一边被反复 seek」叠加解码压力；
                 // 松手后再按播放状态恢复。
                 wasPlayingBeforeSeek = player?.isPlaying == true
@@ -431,7 +478,8 @@ class PlayerActivity : AppCompatActivity() {
                     // 否则会出现「拖一下就没声/不动了」。
                     if (wasPlayingBeforeSeek) exo.play()
                 }
-                showControls()
+                // 松手后：原本在播就继续播放并收起边栏，原本暂停就保持边栏可见。
+                if (wasPlayingBeforeSeek) hideControlsNow() else showControls()
             }
         })
     }
@@ -472,6 +520,8 @@ class PlayerActivity : AppCompatActivity() {
         videoWidth = 0; videoHeight = 0
         resumedThisEpisode = false
         pendingResumeMs = 0L
+        // 本集实际档位未知（缓存命中时拿不到 videoModel 的 height，菜单文案取「未知」）
+        currentVariantHeight = 0
 
         updateEpisodeInfo()
         progress.visibility = View.VISIBLE
@@ -498,6 +548,8 @@ class PlayerActivity : AppCompatActivity() {
                     App.netClient.videoModel(vid, maxVariantHeight())
                 }
                 if (gen != playGen) return@launch
+                // 记录服务端实际给出的档位（服务端可能没有所请求档，会回退到最接近的）
+                currentVariantHeight = video.height
                 val clearFile = withContext(Dispatchers.IO) { prepareClearFile(video) }
                 if (gen != playGen) return@launch
                 startPlayback(clearFile)
@@ -518,16 +570,19 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     /**
-     * 当前设备的清晰度上限（像素高）。低端设备（Android 5.x / 小内存）返回 720，
-     * 其余返回 0（不限制）。见 [com.houg.tv.util.DeviceInfo.isLowEndDevice]。
+     * 当前清晰度上限（像素高），0 表示不限制。
      *
-     * 温馨提醒：这类设备硬解 1080p HEVC 本就贴着上限，倍速 ≥1.5x 或频繁 seek
-     * 时解码吞吐跟不上，表现为卡顿 / 无声。降档 720p 是代价最小、见效最直接的缓解。
+     * 「自动」沿用设备能力判定（低端设备压 720，见 [deviceCapHeight]）；
+     * 其余档位取用户显式选择的上限。传给 [NetClient.videoModel] 后由服务端
+     * 变体列表里挑「不超过上限的最优档」。
      */
-    private fun maxVariantHeight(): Int = variantCapHeight
+    private fun maxVariantHeight(): Int {
+        val mode = QUALITY_MODES[qualityIndex]
+        return if (mode.capHeight < 0) deviceCapHeight else mode.capHeight
+    }
 
-    /** 设备清晰度上限：运行期恒定，只判定一次（isLowEndDevice 会读 /proc/meminfo）。 */
-    private val variantCapHeight: Int by lazy {
+    /** 设备能力上限：运行期恒定，只判定一次（isLowEndDevice 会读 /proc/meminfo）。 */
+    private val deviceCapHeight: Int by lazy {
         try {
             if (DeviceInfo.isLowEndDevice()) 720 else 0
         } catch (e: Throwable) {
@@ -536,11 +591,20 @@ class PlayerActivity : AppCompatActivity() {
     }
 
     /**
-     * 明文缓存文件。**文件名带清晰度档**（720/full），避免低端设备降档后
-     * 误命中其它档位遗留的旧缓存——否则限高形同虚设，仍会拿 1080p 去硬解。
+     * 明文缓存文件的档位标记。**文件名必须带档位**，否则切换清晰度后会误命中
+     * 其它档位遗留的旧缓存——用户以为切了 1080P 实际仍在播 720P。
      */
+    private fun cacheTag(): String = when (QUALITY_MODES[qualityIndex]) {
+        QualityMode.AUTO -> if (deviceCapHeight > 0) "auto720" else "auto"
+        QualityMode.P480 -> "480"
+        QualityMode.P720 -> "720"
+        QualityMode.P1080 -> "1080"
+        QualityMode.ORIGIN -> "full"
+    }
+
+    /** 明文缓存文件（路径含档位标记，切档后自然不复用旧档文件）。 */
     private fun clearFile(vid: String): File =
-        File(cacheDir, "clear_" + vid + "_" + (if (variantCapHeight > 0) "720" else "full") + ".mp4")
+        File(cacheDir, "clear_" + vid + "_" + cacheTag() + ".mp4")
 
     /** 查找该 vid 已预加载的明文缓存文件（存在且非空才算命中）。 */
     private fun findCachedClearFile(vid: String): File? {
@@ -708,7 +772,8 @@ class PlayerActivity : AppCompatActivity() {
         val p = player ?: return
         if (p.isPlaying) p.pause() else p.play()
         recordHistory(force = true)
-        showControls()
+        // 暂停才显示边栏；恢复播放交给 onIsPlayingChanged 收起。
+        if (!p.isPlaying) showControls()
     }
 
     /** 循环切换画幅模式并持久化。 */
@@ -725,9 +790,105 @@ class PlayerActivity : AppCompatActivity() {
         menuFill.text = getString(R.string.menu_fill) + "：" + getString(ASPECT_MODES[aspectMode].labelRes)
     }
 
+    /**
+     * 循环切换清晰度档位：自动 → 480P → 720P → 1080P → 原画 → 自动。
+     *
+     * 切档后**当前集必须重新取流**：清晰度是在取流阶段（videoModel 的变体过滤）
+     * 决定的，仅改内存字段不会影响已下载的明文缓存，所以先清掉本集旧档缓存再起播。
+     */
+    private fun cycleQuality() {
+        qualityIndex = (qualityIndex + 1) % QUALITY_MODES.size
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(PREF_QUALITY, qualityIndex).apply()
+        updateQualityLabel()
+        val label = getString(QUALITY_MODES[qualityIndex].labelRes)
+        toast(getString(R.string.quality_switched, label))
+        pendingQualityHint = true
+        // 旧档缓存按 vid 保留在磁盘上并无害（文件名带档位），但预加载窗口内的
+        // 文件会因档位变化而全部失效，这里清掉，避免白白占空间。
+        cleanupClearFiles(keep = null)
+        replayCurrentEpisode()
+    }
+
+    /** 更新清晰度菜单文案为「清晰度：档位名(+实际档)」。 */
+    private fun updateQualityLabel() {
+        val label = getString(QUALITY_MODES[qualityIndex].labelRes)
+        val actual = if (currentVariantHeight > 0) "（当前 " + currentVariantHeight + "P）" else ""
+        menuQuality.text = getString(R.string.menu_quality) + "：" + label + actual
+    }
+
+    /**
+     * 切档后重播本集：保留播放位置，重新走取流+下载+解密。
+     * 与 [rebuildPlayer] 的区别是不重建播放器（解码方式没变）。
+     *
+     * 位置接续走「先落盘历史、playCurrent 起播时按历史续播」这条现成链路——
+     * playCurrent 会重置 resumedThisEpisode/pendingResumeMs，在这里提前赋值会被覆盖。
+     */
+    private fun replayCurrentEpisode() {
+        recordHistory(force = true)
+        releasePlayer()
+        playCurrent()
+    }
+
+    /** 切档后首个 STATE_READY：提示一次实际生效档位（服务端可能无该档而回退）。 */
+    private fun notifyQualityIfNeeded() {
+        if (!pendingQualityHint) return
+        pendingQualityHint = false
+        val label = getString(QUALITY_MODES[qualityIndex].labelRes)
+        val actual = if (currentVariantHeight > 0) currentVariantHeight.toString() + "P" else "未知"
+        toast(getString(R.string.menu_quality) + " " + label + " → 实际 " + actual)
+        updateQualityLabel()
+    }
+
+    /**
+     * 创建播放器。软解时用自定义 RenderersFactory 只保留 Audio/Video 软解码器；
+     * 硬解时用系统默认（MediaCodec 优先，软解兜底）。
+     */
+    private fun buildPlayer(): ExoPlayer {
+        val builder = ExoPlayer.Builder(this)
+        if (decoderSoft) {
+            builder.setRenderersFactory(SoftwareRenderersFactory(this))
+        }
+        return builder.build()
+    }
+
+    /**
+     * 切换解码方式并立刻生效：释放旧播放器、按新方式重建、从当前位置续播。
+     * 因为解码器是构建期决定的（RenderersFactory），无法热切换，必须重建播放器。
+     */
+    private fun cycleDecoder() {
+        decoderSoft = !decoderSoft
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_DECODER_SOFT, decoderSoft).apply()
+        updateDecoderLabel()
+        val label = getString(if (decoderSoft) R.string.menu_decoder_soft else R.string.menu_decoder_hard)
+        toast(getString(R.string.menu_decoder_switched, label))
+        rebuildPlayer()
+    }
+
+    /** 用当前解码方式重建播放器，保持本集播放位置与播放状态。 */
+    private fun rebuildPlayer() {
+        val old = player ?: return
+        val resumeMs = try { old.currentPosition } catch (_: Exception) { 0L }
+        val wasPlaying = old.isPlaying
+        try { old.release() } catch (_: Exception) {}
+        player = buildPlayer()
+        player!!.setVideoSurfaceView(surfaceView)
+        player!!.setAudioAttributes(AudioAttributes.DEFAULT, /*handleAudioFocus=*/true)
+        try { player!!.setWakeMode(C.WAKE_MODE_NETWORK) } catch (_: Exception) {}
+        player!!.addListener(playerListener)
+        pendingResumeMs = resumeMs
+        resumedThisEpisode = true
+        AppLog.d("PlayerActivity", "重建播放器 decoderSoft=$decoderSoft resume=${resumeMs}ms")
+        playCurrent()
+    }
+
+    /** 更新解码菜单文案为「解码：硬解 / 软解」。 */
+    private fun updateDecoderLabel() {
+        menuDecoder.text = getString(R.string.menu_decoder) + "：" +
+                getString(if (decoderSoft) R.string.menu_decoder_soft else R.string.menu_decoder_hard)
+    }
+
     /** 循环切换倍速档位并持久化。 */
-    private fun cycleSpeed() {
-        speedIndex = (speedIndex + 1) % SPEEDS.size
+    private fun cycleSpeed() {        speedIndex = (speedIndex + 1) % SPEEDS.size
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(PREF_SPEED, speedIndex).apply()
         updateSpeedLabel()
         applySpeed()
@@ -947,7 +1108,8 @@ class PlayerActivity : AppCompatActivity() {
         for (k in pos..keepEnd) vidList.getOrNull(k)?.let { keep.add(it) }
         cleanupClearFiles(keep = keep)
         playCurrent()
-        showControls()
+        // 切集不弹边栏（用户诉求：只有暂停/拖进度条才显示）；集号变化由
+        // 顶栏 episode_info 承载，会在下次暂停/拖动时看到。
         // 注意：switchingEpisode 不在这里复位——要等新集真正 startPlayback
         // 才解除抑制，否则新集准备期间的 STATE_ENDED 会被误判成"本集播完"再次切集。
     }
@@ -1065,18 +1227,21 @@ class PlayerActivity : AppCompatActivity() {
 
     /**
      * 删除 cacheDir 下 clear_ 前缀的明文临时文件。
-     * @param keep 需保留的 vid 集合（当前集与预加载的下一集）；为 null 时全清。
+     * @param keep 需保留的 vid 集合（当前集与预加载窗口）；为 null 时全清。
      *
-     * 文件名有两种形态：新版 `clear_<vid>_720.mp4` / `clear_<vid>_full.mp4`（带清晰度档），
-     * 旧版 `clear_<vid>.mp4`。这里统一剥离前缀/后缀与档位标记还原 vid。
+     * 文件名形态：`clear_<vid>_<档位>.mp4`（档位 auto/auto720/480/720/1080/full，
+     * 旧版还有 `clear_<vid>.mp4` 无档位形态）。这里统一剥离前缀/后缀与档位标记还原 vid。
+     * 注意 keep 匹配的是 vid，不带档位——同 vid 的其它档位文件也会被清，
+     * 这正是想要的（切档后旧档缓存就该删）。
      */
     private fun cleanupClearFiles(keep: Set<String?>? = null) {
+        val tags = arrayOf("_auto720", "_auto", "_480", "_720", "_1080", "_full")
         try {
             cacheDir.listFiles()?.forEach { f ->
                 if (!f.name.startsWith("clear_")) return@forEach
                 if (keep != null) {
-                    val name = f.name.removePrefix("clear_").removeSuffix(".mp4")
-                        .removeSuffix("_720").removeSuffix("_full")
+                    var name = f.name.removePrefix("clear_").removeSuffix(".mp4")
+                    for (t in tags) name = name.removeSuffix(t)
                     if (keep.contains(name)) return@forEach
                 }
                 f.delete()
@@ -1093,16 +1258,28 @@ class PlayerActivity : AppCompatActivity() {
 
     /* ==================== 覆盖层显示 ==================== */
 
-    /** 短暂显示顶部信息条 + 底部进度条（都不是焦点控件，不会抢焦点）。 */
+    /**
+     * 显示顶部信息条 + 底部进度条（都不是焦点控件，不会抢焦点）。
+     *
+     * 用户诉求：边栏**只在暂停或拖动进度条时**出现，播放中不再弹出。
+     * 这里改成「常驻」语义：暂停态保持可见，直到恢复播放（onIsPlayingChanged
+     * 里统一收起）；拖动进度条期间由 tracking 保活，松手恢复播放即收。
+     */
     private fun showControls() {
         topBar.visibility = View.VISIBLE
         controlBar.visibility = View.VISIBLE
         updateProgressText()
-        handler.removeCallbacks(hideControlsRunnable)
-        handler.postDelayed(hideControlsRunnable, 3000)
+        // 播放中的调用（如快进提示）不应让边栏长驻：仍挂自动隐藏。
+        if (player?.isPlaying == true) {
+            handler.removeCallbacks(hideControlsRunnable)
+            handler.postDelayed(hideControlsRunnable, 3000)
+        }
     }
 
     private val hideControlsRunnable = Runnable {
+        // 暂停/拖动期间边栏必须常驻；到点时若还在拖动则不隐藏（tracking 保活）。
+        if (tracking) return@Runnable
+        if (player?.isPlaying == false) return@Runnable
         topBar.visibility = View.GONE
         controlBar.visibility = View.GONE
     }
@@ -1152,8 +1329,10 @@ class PlayerActivity : AppCompatActivity() {
     private fun showMenu() {
         menuPanel.visibility = View.VISIBLE
         updateAspectLabel()
+        updateQualityLabel()
         updateSpeedLabel()
         updateDanmakuLabel()
+        updateDecoderLabel()
         menuFill.post { menuFill.requestFocus() }
     }
 
@@ -1259,14 +1438,24 @@ class PlayerActivity : AppCompatActivity() {
             }
             KeyEvent.KEYCODE_MEDIA_PLAY -> {
                 player?.play()
-                showControls()
+                // 恢复播放：立即收起边栏（onIsPlayingChanged 也会兜一遍）
+                hideControlsNow()
                 return true
             }
             else -> {
-                showControls()
+                // 其余按键（含未知键）不再弹边栏：用户诉求是只有暂停/拖进度条才显示。
             }
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    /** 立即隐藏边栏（恢复播放时调用，不等自动隐藏定时器）。 */
+    private fun hideControlsNow() {
+        handler.removeCallbacks(hideControlsRunnable)
+        if (!tracking) {
+            topBar.visibility = View.GONE
+            controlBar.visibility = View.GONE
+        }
     }
 
     /**
@@ -1288,6 +1477,8 @@ class PlayerActivity : AppCompatActivity() {
         skipSeekGroup(playGen)
         danmakuView.setPositionMs(target)
         recordHistory(force = true)
+        // 快进/快退 = 遥控器上的「拉进度条」：短暂显示边栏（播放中 3 秒后自动收起），
+        // 让用户看清落点；不按暂停/快进时边栏保持隐藏。
         showControls()
         toast(if (dir > 0) getString(R.string.seek_forward, (step / 1000).toString() + "s")
         else getString(R.string.seek_backward, (step / 1000).toString() + "s"))
@@ -1481,8 +1672,12 @@ class PlayerActivity : AppCompatActivity() {
             .setTitle(title)
             .setMessage("继续播放还是退出？")
             .setPositiveButton("继续播放") { _, _ ->
-                if (wasPlaying) player?.play()
-                showControls()
+                if (wasPlaying) {
+                    player?.play()
+                    hideControlsNow()
+                } else {
+                    showControls()
+                }
             }
             .setNegativeButton("退出播放") { _, _ -> finish() }
             .setCancelable(true)
@@ -1561,8 +1756,10 @@ class PlayerActivity : AppCompatActivity() {
 
         private const val PREFS = "player_prefs"
         private const val PREF_ASPECT = "aspect_mode"
+        private const val PREF_QUALITY = "quality_mode"
         private const val PREF_SPEED = "playback_speed"
         private const val PREF_DANMAKU = "danmaku_enabled"
+        private const val PREF_DECODER_SOFT = "decoder_soft"
         private const val DANMAKU_WINDOW_MS = 30000L
 
         /** 快进退基础步长：15 秒 */
@@ -1619,5 +1816,25 @@ class PlayerActivity : AppCompatActivity() {
         }
 
         private val ASPECT_MODES = AspectMode.values()
+
+        /**
+         * 清晰度档位。`capHeight` 为传给取流接口的像素高上限：
+         *  - `-1` = 自动，按设备能力判定（低端设备 720，其余不限）
+         *  - `0`  = 原画，不限制（取服务端最高档）
+         * 其余为显式上限，服务端从变体列表里挑「不超过该值的最优档」；
+         * 若该剧没有对应档位，会自动回退到最接近的档（不会无源可播）。
+         */
+        private enum class QualityMode(val labelRes: Int, val capHeight: Int) {
+            AUTO(R.string.quality_auto, -1),
+            P480(R.string.quality_480, 480),
+            P720(R.string.quality_720, 720),
+            P1080(R.string.quality_1080, 1080),
+            ORIGIN(R.string.quality_origin, 0)
+        }
+
+        private val QUALITY_MODES = QualityMode.values()
+
+        /** 「自动」档下标（默认档）。 */
+        const val QUALITY_AUTO = 0
     }
 }
