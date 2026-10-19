@@ -2,18 +2,22 @@ package com.houg.tv
 
 import android.content.Intent
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.GridLayoutManager
+import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.houg.tv.net.LanInputServer
 import com.houg.tv.net.NetClient
 import com.houg.tv.repo.DramaIndex
+import com.houg.tv.util.QrCode
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -22,12 +26,16 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
- * 搜索页：支持三种搜索方式 + 局域网跨屏输入。
- * 1. 全名/关键词搜索：服务端 /search/<词>（红果自有搜索接口）。
- * 2. 拼音首字母搜索：本地片名索引（剧名→拼音首字母），输入纯字母时匹配。
- * 3. 局域网跨屏输入：电视起本地 HTTP 服务，手机同 Wi-Fi 打开提示网址，
- *    在手机网页上打字回传搜索 —— 取代内置软键盘（遥控器打字体验差，
- *    系统输入法在老盒子上又常唤不出来）。
+ * 搜索页：内置软键盘 + 大家都在搜 + 搜索历史 三栏，外加跨屏输入（二维码）。
+ *
+ * 设计取舍：
+ *  - **内置软键盘**取代系统 IME：电视遥控器唤不出输入法、老盒子 IME 崩溃是常态，
+ *    纯遥控器可打字的键盘是刚需（对齐参考形态）。
+ *  - **大家都在搜**：红果没有独立「热词」接口，用官方热播榜的剧名充当热词
+ *    （既是真实热门内容，也省一个接口），点击即搜该剧名。
+ *  - **跨屏输入**：手机连同一 Wi-Fi 扫码 → 浏览器输入剧名 → 回传电视直接搜索。
+ *    比遥控器打字快得多，是「搜长剧名」的主路径。
+ *  - 搜索仍保留双通道：本地拼音首字母索引（秒开）+ 服务端接口（补全、修正坏 ID）。
  */
 class SearchActivity : AppCompatActivity() {
 
@@ -36,11 +44,15 @@ class SearchActivity : AppCompatActivity() {
     private lateinit var input: EditText
     private lateinit var progress: View
     private lateinit var statusText: TextView
-    private lateinit var historyPanel: View
+    private lateinit var panelsRow: View
+    private lateinit var resultPanel: View
+    private lateinit var hotList: RecyclerView
+    private lateinit var hotAdapter: SearchChipAdapter
     private lateinit var historyChips: RecyclerView
     private lateinit var historyAdapter: SearchChipAdapter
-    private lateinit var lanPanel: View
-    private lateinit var lanHint: TextView
+    private lateinit var softKeyboard: SoftKeyboard
+    /** 跨屏输入二维码弹窗（同一时刻最多一个） */
+    private var qrDialog: AlertDialog? = null
     /** 局域网跨屏输入服务（仅本页存活期间运行） */
     private var lanServer: LanInputServer? = null
     /** 搜索代次：快速连续搜索时丢弃过期响应 */
@@ -55,23 +67,20 @@ class SearchActivity : AppCompatActivity() {
         input = findViewById(R.id.search_input)
         progress = findViewById(R.id.progress)
         statusText = findViewById(R.id.status_text)
-        historyPanel = findViewById(R.id.history_panel)
+        panelsRow = findViewById(R.id.panels_row)
+        resultPanel = findViewById(R.id.result_panel)
+        hotList = findViewById(R.id.hot_list)
         historyChips = findViewById(R.id.history_chips)
-        lanPanel = findViewById(R.id.lan_panel)
-        lanHint = findViewById(R.id.lan_hint)
+        softKeyboard = findViewById(R.id.soft_keyboard)
         val recycler = findViewById<RecyclerView>(R.id.recycler)
 
         adapter = DramaAdapter { drama -> openDetail(drama) }
         recycler.layoutManager = GridLayoutManager(this, adaptiveGridColumns(this, 150, 2, 10))
         recycler.adapter = adapter
 
-        // 搜索记录：用 RecyclerView 自动换行展示，遥控器可直接导航到每条
+        // 搜索记录：自动换行展示，遥控器可直接导航到每条
         historyAdapter = SearchChipAdapter(
-            onClick = { kw ->
-                input.setText(kw)
-                input.setSelection(kw.length)
-                doSearch()
-            },
+            onClick = { kw -> applyKeyword(kw) },
             onLongClick = { kw ->
                 App.searchHistory.remove(kw)
                 renderSearchHistory()
@@ -82,9 +91,16 @@ class SearchActivity : AppCompatActivity() {
             GridLayoutManager(this, adaptiveGridColumns(this, 130, 2, 8))
         historyChips.adapter = historyAdapter
 
+        // 大家都在搜：竖向单列列表（目标形态是逐行铺开，遥控器上下移动即可）
+        hotAdapter = SearchChipAdapter(
+            onClick = { kw -> applyKeyword(kw) }
+        )
+        hotList.layoutManager = LinearLayoutManager(this)
+        hotList.adapter = hotAdapter
+
         findViewById<View>(R.id.btn_back).setOnClickListener { finish() }
         findViewById<View>(R.id.btn_do_search).setOnClickListener { doSearch() }
-        findViewById<View>(R.id.btn_lan_input).setOnClickListener { toggleLanInput() }
+        findViewById<View>(R.id.btn_lan_input).setOnClickListener { showQrInput() }
         findViewById<View>(R.id.btn_clear_history).setOnClickListener { confirmClearHistory() }
 
         input.setOnEditorActionListener { _, actionId, _ ->
@@ -92,6 +108,19 @@ class SearchActivity : AppCompatActivity() {
                 doSearch()
                 true
             } else false
+        }
+
+        // 内置键盘：点键把字符追加到输入框；功能键走删除/清空/搜索
+        softKeyboard.setOnKey { c -> appendChar(c) }
+        softKeyboard.setOnCmd { cmd ->
+            when (cmd) {
+                SoftKeyboard.Cmd.BACKSPACE -> backspace()
+                SoftKeyboard.Cmd.CLEAR -> {
+                    input.setText("")
+                    input.setSelection(0)
+                }
+                SoftKeyboard.Cmd.SEARCH -> doSearch()
+            }
         }
 
         // 先读本地索引；若缺失则后台重建
@@ -102,8 +131,60 @@ class SearchActivity : AppCompatActivity() {
         }
 
         renderSearchHistory()
+        loadHotWords()
 
-        input.requestFocus()
+        // 默认焦点给键盘首键（遥控器进页面即可直接打字），而不是输入框
+        softKeyboard.focusFirstKey()
+    }
+
+    /* ==================== 输入辅助 ==================== */
+
+    /** 键盘输入的字符追加到输入框末尾（无论焦点在哪，都以遥控器输入为准）。 */
+    private fun appendChar(c: Char) {
+        val cur = input.text.toString()
+        val next = cur + c
+        input.setText(next)
+        input.setSelection(next.length)
+    }
+
+    private fun backspace() {
+        val cur = input.text.toString()
+        if (cur.isEmpty()) return
+        val next = cur.substring(0, cur.length - 1)
+        input.setText(next)
+        input.setSelection(next.length)
+    }
+
+    /** 用给定关键词填充输入框并立即搜索（历史/热词共用）。 */
+    private fun applyKeyword(kw: String) {
+        input.setText(kw)
+        input.setSelection(kw.length)
+        doSearch()
+    }
+
+    /* ==================== 大家都在搜 ==================== */
+
+    /**
+     * 热词取自红果官方「热播榜」（网页 /rank/hot-drama，免签名）。
+     * 只取前 [HOT_MAX] 条剧名——榜单本身是热门内容，比伪造热词更有意义。
+     * 失败静默（热词是锦上添花，不该给用户报错）。
+     */
+    private fun loadHotWords() {
+        scope.launch {
+            val words = try {
+                withContext(Dispatchers.IO) {
+                    val board = NetClient.RANK_BOARDS.firstOrNull() ?: return@withContext emptyList()
+                    App.netClient.ranking(board, 1).items
+                        .map { it.drama.title }
+                        .filter { it.isNotBlank() }
+                        .distinct()
+                        .take(HOT_MAX)
+                }
+            } catch (e: Exception) {
+                emptyList()
+            }
+            hotAdapter.submit(words)
+        }
     }
 
     /* ==================== 搜索记录 ==================== */
@@ -111,12 +192,6 @@ class SearchActivity : AppCompatActivity() {
     /** 渲染搜索记录胶囊（最多展示 CHIP_MAX 条，避免铺满屏幕）。 */
     private fun renderSearchHistory() {
         val list = App.searchHistory.list()
-        if (list.isEmpty()) {
-            historyPanel.visibility = View.GONE
-            historyAdapter.submit(emptyList())
-            return
-        }
-        historyPanel.visibility = View.VISIBLE
         historyAdapter.submit(list.take(CHIP_MAX))
     }
 
@@ -133,61 +208,75 @@ class SearchActivity : AppCompatActivity() {
             .show()
     }
 
-    /* ==================== 局域网跨屏输入 ==================== */
+    /* ==================== 跨屏输入（二维码） ==================== */
 
     /**
-     * 开关局域网输入：开启后在 TV 上起本地 HTTP 服务，页面提示手机访问地址。
-     * 手机与 TV 需在同一 Wi-Fi；手机打开网址 → 输入剧名 → 回传后立即搜索。
+     * 弹出二维码：电视起局域网输入服务，手机扫码直达输入页。
+     * 服务随页面销毁关闭；每次点开重启一个新的随机端口（避免残留服务被扫到）。
      */
-    private fun toggleLanInput() {
-        if (lanServer != null) {
-            stopLanInput()
-            return
-        }
+    private fun showQrInput() {
         val server = LanInputServer { keyword ->
-            input.setText(keyword)
-            input.setSelection(keyword.length)
-            doSearch()
+            dismissQrDialog()
+            if (keyword.isNotEmpty()) applyKeyword(keyword)
         }
         val port = server.start()
         val address = server.localAddress()
         if (port == 0 || address == null) {
             server.stop()
-            lanHint.text = getString(R.string.lan_input_unavailable)
-            lanPanel.visibility = View.VISIBLE
             Toast.makeText(this, R.string.lan_input_unavailable, Toast.LENGTH_LONG).show()
             return
         }
+        // 换服务时关掉上一个，避免端口泄漏
+        lanServer?.stop()
         lanServer = server
+
         val url = "http://$address:$port"
-        lanHint.text = getString(R.string.lan_input_hint, url)
-        lanPanel.visibility = View.VISIBLE
-        Toast.makeText(this, getString(R.string.lan_input_hint, url), Toast.LENGTH_LONG).show()
+        val view = layoutInflater.inflate(R.layout.dialog_qr_input, null)
+        val bitmap = QrCode.encode(url, QR_SIZE_PX)
+        if (bitmap != null) {
+            view.findViewById<ImageView>(R.id.qr_image).setImageBitmap(bitmap)
+        }
+        view.findViewById<TextView>(R.id.qr_url)
+            .text = getString(R.string.scan_url_hint, url)
+
+        qrDialog = AlertDialog.Builder(this)
+            .setView(view)
+            .setCancelable(true)
+            .create()
+        qrDialog?.setOnDismissListener { stopLanInput() }
+        view.findViewById<View>(R.id.qr_close).setOnClickListener { dismissQrDialog() }
+        qrDialog?.show()
+    }
+
+    private fun dismissQrDialog() {
+        qrDialog?.dismiss()
+        qrDialog = null
     }
 
     private fun stopLanInput() {
         lanServer?.stop()
         lanServer = null
-        lanPanel.visibility = View.GONE
     }
 
-    /** 后台重建片名索引（首次进入且无本地缓存时）。 */
+    /**
+     * 后台重建片名索引（首次进入且无本地缓存时）。
+     *
+     * 不动 progress/statusText：它们属于结果面板，索引重建时三栏才是可见的；
+     * 若在这里无条件隐藏转圈，会把「重建期间用户恰好发起的搜索」的进度也吞掉。
+     * 索引没好时搜索走纯服务端，不阻塞用户。
+     */
     private fun rebuildIndexInBackground() {
-        progress.visibility = View.VISIBLE
-        statusText.text = getString(R.string.index_building)
-        statusText.visibility = View.VISIBLE
         scope.launch {
             try {
                 DramaIndex.rebuild(this@SearchActivity, App.netClient)
                 indexReady = true
             } catch (e: Exception) {
                 indexReady = false
-            } finally {
-                statusText.visibility = View.GONE
-                progress.visibility = View.GONE
             }
         }
     }
+
+    /* ==================== 搜索 ==================== */
 
     private fun doSearch() {
         val keyword = input.text.toString().trim()
@@ -196,10 +285,11 @@ class SearchActivity : AppCompatActivity() {
         App.searchHistory.add(keyword)
         renderSearchHistory()
         input.clearFocus()
-        findViewById<View>(R.id.btn_do_search).requestFocus()
 
         searchGen++
         val gen = searchGen
+        panelsRow.visibility = View.GONE
+        resultPanel.visibility = View.VISIBLE
         progress.visibility = View.VISIBLE
         statusText.visibility = View.GONE
         adapter.submit(emptyList())
@@ -218,9 +308,8 @@ class SearchActivity : AppCompatActivity() {
                 }
 
                 // 服务端搜索兜底/补全：本地索引来自分类翻页（每分类有页数上限），
-                // 排在截断点之后的剧会缺失（例：多季剧缺个别季，如用户反馈的
-                // 「唢呐修仙」缺 6/8/9 季）。因此本地命中后仍查一次服务端，
-                // 用更全的数据合并修正（建议接口单次即可召回该系列全部季）。
+                // 排在截断点之后的剧会缺失（例：多季剧缺个别季）。因此本地命中后
+                // 仍查一次服务端，用更全的数据合并修正。
                 val remote = withContext(Dispatchers.IO) {
                     App.netClient.search(keyword)
                 }
@@ -233,7 +322,6 @@ class SearchActivity : AppCompatActivity() {
                 }
             } catch (e: Exception) {
                 if (gen != searchGen) return@launch
-                // 本地结果已展示时不覆盖为错误提示，仅无结果时提示
                 if (adapter.itemCount == 0) {
                     statusText.text = getString(R.string.load_failed)
                     statusText.visibility = View.VISIBLE
@@ -305,7 +393,23 @@ class SearchActivity : AppCompatActivity() {
         startActivity(intent)
     }
 
+    /**
+     * 返回键优先「退回三栏」而不是直接退出：
+     * 看完搜索结果想改关键词时，一步回键盘比重新进搜索页顺手。
+     * 焦点仍落键盘首键（与进页面时一致），遥控器可继续上下键改词。
+     */
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK && resultPanel.visibility == View.VISIBLE) {
+            resultPanel.visibility = View.GONE
+            panelsRow.visibility = View.VISIBLE
+            softKeyboard.focusFirstKey()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
     override fun onDestroy() {
+        dismissQrDialog()
         stopLanInput()
         scope.cancel()
         super.onDestroy()
@@ -313,6 +417,12 @@ class SearchActivity : AppCompatActivity() {
 
     private companion object {
         /** 搜索记录最多展示的胶囊数（超出需点「清空」管理，避免铺满屏幕） */
-        const val CHIP_MAX = 8
+        const val CHIP_MAX = 12
+
+        /** 热词条数（榜单前 N 条剧名，够填满中栏即可） */
+        const val HOT_MAX = 10
+
+        /** 二维码位图边长（dp 换算前的 px 基准，实际展示 220dp） */
+        const val QR_SIZE_PX = 660
     }
 }

@@ -125,6 +125,12 @@ class PlayerActivity : AppCompatActivity() {
      */
     private var ioRetriedVid: String? = null
     /**
+     * 因「解码器初始化失败」已自动切软解重试过的 vid。
+     * 每个 vid 只自动切一次——真不支持时（片源只有 HEVC 且软解也扛不住）
+     * 反复重建播放器只会让用户看到无限闪烁。
+     */
+    private var autoSoftFailoverVid: String? = null
+    /**
      * 切集抑制的安全兜底：STATE_READY / onPlayerError 理论上都会解除抑制，
      * 但为了防任何未知的卡死路径（如某些 ROM 回调丢失），切集时同时挂一个
      * 延迟任务，到点强制解除——上下键永不能被锁死。
@@ -280,7 +286,38 @@ class PlayerActivity : AppCompatActivity() {
                 showError("视频文件异常，请检查设备存储空间后重试（" + error.errorCodeName + "）")
                 return
             }
+
+            // ===== 解码失败兜底：自动切软解重试一次 =====
+            // 线上日志（DWIN-380P / 华为 Android 12）：红果下发的 1080p 变体是
+            // bytevc1(HEVC)，而该 SoC 的 HEVC 硬解初始化失败 → 黑屏。
+            // videoModel 已优先给不支持 HEVC 的设备选 H.264，但仍有两点兜不住：
+            // ① 探测误判（ROM 谎报支持）；② 片源只有 HEVC 一档。
+            // 此时硬解必失败，自动切软解往往能救回（软解 H.264/HEVC 虽然吃 CPU，
+            // 但至少出画面）。每个 vid 只自动切一次，避免在真·不支持时反复重建播放器。
+            if (isDecodeFailure(error) && !decoderSoft && autoSoftFailoverVid != vidList.getOrNull(currentPos)) {
+                autoSoftFailoverVid = vidList.getOrNull(currentPos)
+                AppLog.d("PlayerActivity", "解码失败(" + error.errorCodeName
+                        + ")，自动切软解重试 vid=" + autoSoftFailoverVid)
+                decoderSoft = true
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                    .putBoolean(PREF_DECODER_SOFT, true).apply()
+                updateDecoderLabel()
+                toast(getString(R.string.decoder_auto_soft))
+                currentEpisodeFailed = false
+                rebuildPlayer()
+                return
+            }
             showError(describePlaybackError(error))
+        }
+    }
+
+    /** 是否解码器类失败（初始化/查询/解码），可由「切软解」尝试救回。 */
+    private fun isDecodeFailure(error: PlaybackException): Boolean {
+        return when (error.errorCode) {
+            PlaybackException.ERROR_CODE_DECODING_FAILED,
+            PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
+            PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED -> true
+            else -> false
         }
     }
 

@@ -14,8 +14,8 @@ android {
         // 适配 Android 5.0（API 21）及以上：红果片源为 HEVC+CENC，需 API 21 起的 HEVC 硬解能力
         minSdk = 21
         targetSdk = 35
-        versionCode = 114
-        versionName = "1.0.14"
+        versionCode = 115
+        versionName = "1.0.15"
     }
 
     // 传统 View 体系，不使用 Compose
@@ -59,6 +59,10 @@ dependencies {
     implementation("com.github.msisuzney:GlideHeifDecoder:0.5") {
         exclude(group = "com.github.msisuzney.GlideHeifDecoder", module = "heifdecoder-debug")
     }
+
+    // 二维码生成（跨屏输入弹窗：电视出码，手机扫码打开局域网输入页）
+    // core 为纯 Java 无 Android 依赖，minSdk 21 安全
+    implementation("com.google.zxing:core:3.5.3")
 
     // 协程（API 14+ 兼容）
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")

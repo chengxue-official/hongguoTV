@@ -1,5 +1,8 @@
 package com.houg.tv.net;
 
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
+import android.os.Build;
 import android.util.Base64;
 
 import com.houg.tv.sign.HongguoCrypto;
@@ -169,7 +172,7 @@ public final class NetClient {
     }
 
     public static final class Variant {
-        public final String codec;        // codec_type（bytevc1=HEVC）
+        public final String codec;        // codec_type（bytevc1=HEVC/H.265，h264=AVC/H.264）
         public final int height;          // 清晰度高度
         public final List<String> urls;   // 该变体的多地址（已去重+解码）
         public final byte[] cencKey;      // CENC-AES-128 密钥（未加密时为 null）
@@ -182,6 +185,86 @@ public final class NetClient {
             this.cencKey = cencKey;
             this.encrypted = encrypted;
         }
+    }
+
+    /**
+     * 变体选择：优先 H.264，同编码内按高度降序。
+     *
+     * 背景（线上日志 DWIN-380P / 华为 Android 12）：红果同时下发 h264 与 bytevc1(HEVC)
+     * 变体，旧逻辑一律按高度选，1080p 那档往往是 HEVC——而部分电视 SoC（尤其
+     * 全志/晨星老方案与部分华为定制机）**根本没有 HEVC 硬解**，MediaCodec 初始化
+     * 失败即黑屏无提示。故：
+     *  - 设备不支持 HEVC 时（[deviceSupportsHevc] = false）：完全排除 HEVC 变体，
+     *    只在 H.264 里选，宁可降清晰度也要能播；
+     *  - 设备支持 HEVC 时：保持原策略（HEVC 效率更高、同清晰度码率更低），
+     *    但 H.264 与 HEVC 同高度时优先 H.264——兼容性优先，避免软解兜底翻车。
+     * H.264 缺失时仍返回 HEVC，不做强制丢弃（否则老片源可能无源可播）。
+     */
+    private static void sortVariantsForDevice(List<Variant> variants) {
+        final boolean hevcOk = deviceSupportsHevc();
+        if (!hevcOk) {
+            List<Variant> avcOnly = new ArrayList<>();
+            for (Variant v : variants) {
+                if (!isHevc(v.codec)) avcOnly.add(v);
+            }
+            if (!avcOnly.isEmpty()) {
+                variants.clear();
+                variants.addAll(avcOnly);
+            }
+        }
+        Collections.sort(variants, new Comparator<Variant>() {
+            @Override
+            public int compare(Variant a, Variant b) {
+                if (a.height != b.height) return b.height - a.height;
+                int ra = isHevc(a.codec) ? 1 : 0;
+                int rb = isHevc(b.codec) ? 1 : 0;
+                return ra - rb;
+            }
+        });
+    }
+
+    /** codec_type 是否为 HEVC（红果下发的 bytevc1 即 H.265）。 */
+    private static boolean isHevc(String codec) {
+        return codec != null && codec.toLowerCase().contains("bytevc1");
+    }
+
+    /**
+     * 设备是否具备 HEVC(H.265) 硬解能力（结果缓存，探测只在首次调用做一次）。
+     *
+     * 用 MediaCodecList 查 `video/hevc` 的**硬件**解码器：有的 ROM 会挂软解
+     * （名含 google/software），软解 1080p HEVC 在电视 SoC 上必然卡死，
+     * 不能算「支持」。什么都不信时保守返回 false（走 H.264 更安全）。
+     */
+    private static Boolean hevcSupportedCache = null;
+
+    private static synchronized boolean deviceSupportsHevc() {
+        if (hevcSupportedCache != null) return hevcSupportedCache;
+        boolean ok = false;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
+            try {
+                for (MediaCodecInfo info : new MediaCodecList(MediaCodecList.REGULAR_CODECS)
+                        .getCodecInfos()) {
+                    if (info.isEncoder()) continue;
+                    String name = info.getName().toLowerCase();
+                    if (name.contains("google") || name.contains("software")
+                            || name.contains("sw.") || name.contains("ffmpeg")) {
+                        continue; // 软解，不计入
+                    }
+                    for (String type : info.getSupportedTypes()) {
+                        if ("video/hevc".equalsIgnoreCase(type)) {
+                            ok = true;
+                            break;
+                        }
+                    }
+                    if (ok) break;
+                }
+            } catch (Throwable t) {
+                ok = false;
+            }
+        }
+        AppLog.INSTANCE.d(TAG, "设备 HEVC 硬解能力=" + ok);
+        hevcSupportedCache = ok;
+        return ok;
     }
 
     public static final class VideoModel {
@@ -787,7 +870,8 @@ public final class NetClient {
         AppLog.INSTANCE.d(TAG, "videoModel video_id=" + vid);
         JSONObject model = fetchVideoModel(vid);
         if (model == null) throw new Exception("红果播放信息为空");
-        // 收集 bytevc1(HEVC) 变体：只跳过 bytevc2（AV1），按高度降序选最优
+        // 收集非 AV1 变体（保留 h264 + bytevc1/HEVC），再按设备解码能力排序选择。
+        // 旧逻辑注释写的「只收集 bytevc1」与实现不符：实际只跳过 bytevc2(AV1)。
         List<Variant> variants = new ArrayList<>();
         Exception keyErr = null;
         for (JSONObject v : videoListVariants(model)) {
@@ -817,12 +901,8 @@ public final class NetClient {
             int height = definitionHeight(meta);
             variants.add(new Variant(codec, height, addrs, cencKey, encrypted));
         }
-        Collections.sort(variants, new Comparator<Variant>() {
-            @Override
-            public int compare(Variant a, Variant b) {
-                return b.height - a.height;
-            }
-        });
+        // 先按设备解码能力筛/排序（不支持 HEVC 的设备只留 H.264），再套清晰度上限
+        sortVariantsForDevice(variants);
 
         // ===== 低端设备:限制清晰度上限 =====
         // 1080p HEVC 在 Android 5.x / 小内存设备上硬解余量极小,倍速(≥1.5x)或

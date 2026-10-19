@@ -7,12 +7,13 @@ import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 
 /**
- * 搜索记录胶囊 Adapter：自动换行排列关键词。
- * 点击 = 用该词重新搜索；长按 = 删除该条。
+ * 搜索关键词胶囊 Adapter：自动换行排列关键词。
+ * 点击 = 用该词重新搜索；长按 = 删除该条（[onLongClick] 为空表示不支持删除，
+ * 用于「大家都在搜」——热词不该被用户删掉）。
  */
 class SearchChipAdapter(
     private val onClick: (String) -> Unit,
-    private val onLongClick: (String) -> Unit
+    private val onLongClick: ((String) -> Unit)? = null
 ) : RecyclerView.Adapter<SearchChipAdapter.VH>() {
 
     private val items = ArrayList<String>()
@@ -33,9 +34,14 @@ class SearchChipAdapter(
         val kw = items[position]
         holder.text.text = kw
         holder.text.setOnClickListener { onClick(kw) }
-        holder.text.setOnLongClickListener {
-            onLongClick(kw)
-            true
+        val long = onLongClick
+        if (long != null) {
+            holder.text.setOnLongClickListener {
+                long(kw)
+                true
+            }
+        } else {
+            holder.text.setOnLongClickListener(null)
         }
     }
 

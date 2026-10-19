@@ -33,10 +33,14 @@
     <string name="aspect_stretch">拉伸</string>
     <string name="aspect_original">原始</string>
     <string name="aspect_fill">填充</string>
-    <string name="lan_input">手机输入</string>
-    <string name="lan_input_hint">手机连同一 Wi-Fi，浏览器打开：%1$s（在此输入剧名，立即回传到电视搜索）</string>
-    <string name="lan_input_unavailable">无法启动手机输入（未获取到局域网地址，请确认电视已连 Wi-Fi，且与手机在同一网络）</string>
-    <string name="index_building">正在建立片名索引，请稍候…</string>
+    <string name="lan_input">跨屏输入</string>
+    <string name="lan_input_unavailable">无法启动跨屏输入（未获取到局域网地址，请确认电视已连 Wi-Fi，且与手机在同一网络）</string>
+    <string name="keyboard">键盘</string>
+    <string name="key_delete">删除</string>
+    <string name="hot_search">大家都在搜</string>
+    <string name="scan_title">手机扫码输入</string>
+    <string name="scan_hint">用手机微信/相机扫二维码，在打开的页面输入剧名，点「发送到电视」即可。\n手机需与电视连接同一个 Wi-Fi。</string>
+    <string name="scan_url_hint">也可手动在手机浏览器输入：%1$s</string>
     <string name="community_hint">交流群 1130515703 · 免费分享，谨防受骗</string>
 
     <!-- 收藏 -->
@@ -80,6 +84,7 @@
     <string name="menu_decoder_hard">硬解</string>
     <string name="menu_decoder_soft">软解</string>
     <string name="menu_decoder_switched">解码方式已切换为%1$s，正在重新起播</string>
+    <string name="decoder_auto_soft">硬解失败，已自动切换为软解重试</string>
     <string name="menu_exit">退出播放</string>
     <string name="press_again_to_exit">再按一次返回键退出播放</string>
 
